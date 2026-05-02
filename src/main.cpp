@@ -93,13 +93,21 @@ constexpr int kAnalyzerDisplayWidth = 200;
 constexpr int kAnalyzerDisplayHeight = 135;
 constexpr int kAnalyzerDisplayX = kFftDisplayX;
 constexpr int kAnalyzerDisplayY = kFftDisplayY - kAnalyzerDisplayHeight;
+constexpr int kVuDisplayWidth = kAnalyzerDisplayWidth - 16;
+constexpr int kVuDisplayHeight = kAnalyzerDisplayHeight;
+constexpr int kVuDisplayX = kFftDisplayX - kVuDisplayWidth;
+constexpr int kVuDisplayY = kFftDisplayY;
+constexpr int kAnalogVuDisplayWidth = kVuDisplayWidth;
+constexpr int kAnalogVuDisplayHeight = kVuDisplayHeight;
+constexpr int kAnalogVuDisplayX = kFftDisplayX + kFftDisplayWidth;
+constexpr int kAnalogVuDisplayY = kFftDisplayY;
 
 constexpr int kDisplayLowBin = 4;     // 62.5 Hz at 16 kHz; avoids DC/rumble bins.
 constexpr int kDisplayHighBin = 256;  // 4 kHz at 16 kHz sample rate.
 constexpr float kNoiseMarginDb = 8.0f;
 constexpr float kDisplayRangeDb = 52.0f;
 constexpr uint32_t kDisplayNoiseCalibrationMs = 5000;
-constexpr uint32_t kDisplayNoiseRecalibrationDelayMs = 1000;
+constexpr uint32_t kDisplayNoiseRecalibrationDelayMs = 500;
 
 constexpr int kAnalyzerBandCount = 32;
 constexpr int kAnalyzerBandWidth = 5;
@@ -109,6 +117,10 @@ constexpr float kAnalyzerHighHz = 4000.0f;
 constexpr float kAnalyzerSmoothing = 0.65f;
 constexpr float kAnalyzerNoiseMarginDb = 10.0f;
 constexpr float kAnalyzerRangeDb = 58.0f;
+constexpr float kVuMinDb = -60.0f;
+constexpr float kVuMaxDb = 0.0f;
+constexpr int16_t kVuClipThreshold = 32600;
+constexpr uint8_t kVuClipHoldFrames = 8;
 constexpr uint32_t kDevSerialStartupDelayMs = 5000;
 constexpr uint32_t kLoopHousekeepingIntervalMs = 10;
 constexpr uint32_t kDiagnosticsFrames = 120;
@@ -128,6 +140,9 @@ static_assert(kAnalyzerActiveWidth <= kAnalyzerDisplayWidth,
               "Analyzer bands are too wide for the display");
 static_assert(kWifiLabelWidth > 0 && kWifiLabelHeight > 0,
               "WiFi label must fit on the right of the scope display");
+static_assert(kVuDisplayX >= 0, "VU display must fit left of the analyzer");
+static_assert(kAnalogVuDisplayX + kAnalogVuDisplayWidth <= kScreenWidth,
+              "Analogue VU display must fit right of the analyzer");
 static_assert(kCalibrationLabelWidth > 0 && kCalibrationLabelHeight > 0,
               "Calibration label must fit on the display");
 static_assert(kAnalyzerDisplayWidth == kScopeDisplayWidth &&
@@ -163,6 +178,7 @@ SemaphoreHandle_t serialMutex = nullptr;
 TaskHandle_t displayTaskHandle = nullptr;
 TaskHandle_t captureTaskHandle = nullptr;
 TaskHandle_t sdWriterTaskHandle = nullptr;
+TaskHandle_t buttonTaskHandle = nullptr;
 
 fft_config_t *fftPlan = nullptr;
 
@@ -176,8 +192,23 @@ uint8_t spectrogram[kFftDisplayWidth][kFftDisplayHeight];
 uint8_t analyzerBarHeights[kAnalyzerBandCount];
 uint8_t scopeTraceTop[kScopeDisplayWidth];
 uint8_t scopeTraceBottom[kScopeDisplayWidth];
+float vuLevel = 0.0f;
+float vuPeakLevel = 0.0f;
+bool vuClipActive = false;
 uint16_t fftPixels[kFftDisplayWidth * kFftDisplayHeight];
 uint16_t graphPixels[kScopeDisplayWidth * kScopeDisplayHeight];
+uint16_t *vuBasePixels = nullptr;
+uint16_t *analogVuBasePixels = nullptr;
+uint16_t *vuDrawPixels = nullptr;
+uint16_t *analogVuDrawPixels = nullptr;
+int vuDrawWidth = kVuDisplayWidth;
+int vuDrawHeight = kVuDisplayHeight;
+int vuDrawOriginX = 0;
+int vuDrawOriginY = 0;
+int analogVuDrawWidth = kAnalogVuDisplayWidth;
+int analogVuDrawHeight = kAnalogVuDisplayHeight;
+int analogVuDrawOriginX = 0;
+int analogVuDrawOriginY = 0;
 uint16_t wifiLabelPixels[kWifiLabelWidth * kWifiLabelHeight];
 uint16_t calibrationLabelPixels[kCalibrationLabelWidth * kCalibrationLabelHeight];
 uint16_t palette[256];
@@ -185,6 +216,18 @@ uint16_t solidLine[kScreenWidth];
 uint16_t spectrogramWriteColumn = 0;
 bool analyzerReady = false;
 bool scopeTraceReady = false;
+bool vuReady = false;
+bool vuBaseReady = false;
+bool vuScreenReady = false;
+int vuLastFillWidth = -1;
+int vuLastPeakX = -1;
+bool vuLastClipActive = false;
+bool vuLastReady = false;
+bool analogVuBaseReady = false;
+bool analogVuScreenReady = false;
+int analogVuLastNeedleDeg = -1;
+bool analogVuLastClipActive = false;
+bool analogVuLastReady = false;
 
 volatile bool captureEnabled = true;
 volatile bool frameDirty = true;
@@ -206,6 +249,8 @@ int16_t lastFrameMax = 0;
 uint16_t lastFrameClipped = 0;
 float analyzerLevels[kAnalyzerBandCount];
 float scopeScale = 4096.0f;
+float vuSmoothedLevel = 0.0f;
+uint8_t vuClipHold = 0;
 
 enum class SdCommand : uint8_t {
     Start,
@@ -323,6 +368,176 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
                  ((uint16_t)b >> 3);
     return (c >> 8) | (c << 8);
 }
+
+struct AnalogVuTheme {
+    uint16_t face;
+    uint16_t faceStripe;
+    uint16_t faceGlow;
+    uint16_t border;
+    uint16_t innerArc;
+    uint16_t greenArc;
+    uint16_t amberArc;
+    uint16_t redArc;
+    uint16_t tick;
+    uint16_t needle;
+    uint16_t label;
+    uint16_t labelShadow;
+    uint16_t pivotOuter;
+    uint16_t pivotInner;
+    uint16_t clipOn;
+    uint16_t clipOff;
+    uint16_t clipHighlightOn;
+    uint16_t clipHighlightOff;
+    int glowCenterX;
+    int glowCenterY;
+    int glowRadius;
+    int glowStrength;
+    int arcPointHalfThickness;
+    int outerArcOutwardPixels;
+    int minorTickHalfThickness;
+    int majorTickHalfThickness;
+    int needleHalfThickness;
+    int labelX;
+    int labelY;
+    int labelScale;
+    int labelHalfThickness;
+    int labelShadowOffsetX;
+    int labelShadowOffsetY;
+    int clipX;
+    int clipY;
+    int clipRadius;
+    int clipHighlightOffsetX;
+    int clipHighlightOffsetY;
+    int clipHighlightRadius;
+};
+
+const AnalogVuTheme kAnalogVuLightTheme = {
+    .face = rgb565(246, 246, 238),
+    .faceStripe = rgb565(238, 238, 230),
+    .faceGlow = rgb565(252, 236, 174),
+    .border = rgb565(12, 14, 16),
+    .innerArc = rgb565(222, 224, 216),
+    .greenArc = rgb565(18, 150, 58),
+    .amberArc = rgb565(220, 165, 28),
+    .redArc = rgb565(210, 20, 18),
+    .tick = rgb565(86, 88, 84),
+    .needle = rgb565(185, 16, 18),
+    .label = rgb565(18, 18, 16),
+    .labelShadow = rgb565(218, 218, 210),
+    .pivotOuter = rgb565(12, 14, 16),
+    .pivotInner = rgb565(178, 178, 170),
+    .clipOn = rgb565(210, 20, 18),
+    .clipOff = rgb565(210, 210, 202),
+    .clipHighlightOn = rgb565(255, 180, 160),
+    .clipHighlightOff = rgb565(236, 236, 226),
+    .glowCenterX = kAnalogVuDisplayWidth / 2,
+    .glowCenterY = kAnalogVuDisplayHeight + 18,
+    .glowRadius = 118,
+    .glowStrength = 26,
+    .arcPointHalfThickness = 1,
+    .outerArcOutwardPixels = 3,
+    .minorTickHalfThickness = 1,
+    .majorTickHalfThickness = 2,
+    .needleHalfThickness = 2,
+    .labelX = 70,
+    .labelY = 74,
+    .labelScale = 3,
+    .labelHalfThickness = 1,
+    .labelShadowOffsetX = 1,
+    .labelShadowOffsetY = 1,
+    .clipX = kAnalogVuDisplayWidth - 19,
+    .clipY = 20,
+    .clipRadius = 6,
+    .clipHighlightOffsetX = 2,
+    .clipHighlightOffsetY = -2,
+    .clipHighlightRadius = 2,
+};
+
+const AnalogVuTheme kAnalogVuDarkTheme = {
+    .face = rgb565(15, 18, 22),
+    .faceStripe = rgb565(21, 25, 30),
+    .faceGlow = rgb565(48, 42, 30),
+    .border = rgb565(190, 204, 208),
+    .innerArc = rgb565(58, 66, 72),
+    .greenArc = rgb565(35, 210, 96),
+    .amberArc = rgb565(238, 188, 48),
+    .redArc = rgb565(245, 55, 45),
+    .tick = rgb565(150, 160, 164),
+    .needle = rgb565(255, 82, 76),
+    .label = rgb565(215, 224, 226),
+    .labelShadow = rgb565(0, 0, 0),
+    .pivotOuter = rgb565(190, 204, 208),
+    .pivotInner = rgb565(72, 82, 88),
+    .clipOn = rgb565(255, 28, 22),
+    .clipOff = rgb565(52, 10, 12),
+    .clipHighlightOn = rgb565(255, 190, 168),
+    .clipHighlightOff = rgb565(94, 28, 26),
+    .glowCenterX = kAnalogVuDisplayWidth / 2,
+    .glowCenterY = kAnalogVuDisplayHeight + 24,
+    .glowRadius = 120,
+    .glowStrength = 34,
+    .arcPointHalfThickness = 1,
+    .outerArcOutwardPixels = 4,
+    .minorTickHalfThickness = 1,
+    .majorTickHalfThickness = 2,
+    .needleHalfThickness = 2,
+    .labelX = 70,
+    .labelY = 74,
+    .labelScale = 3,
+    .labelHalfThickness = 1,
+    .labelShadowOffsetX = 1,
+    .labelShadowOffsetY = 1,
+    .clipX = kAnalogVuDisplayWidth - 19,
+    .clipY = 20,
+    .clipRadius = 6,
+    .clipHighlightOffsetX = 2,
+    .clipHighlightOffsetY = -2,
+    .clipHighlightRadius = 2,
+};
+
+const AnalogVuTheme kAnalogVuIncandescentTheme = {
+    .face = rgb565(76, 47, 18),
+    .faceStripe = rgb565(92, 56, 20),
+    .faceGlow = rgb565(255, 202, 82),
+    .border = rgb565(34, 18, 8),
+    .innerArc = rgb565(112, 70, 26),
+    .greenArc = rgb565(96, 90, 30),
+    .amberArc = rgb565(206, 125, 22),
+    .redArc = rgb565(184, 38, 28),
+    .tick = rgb565(62, 34, 14),
+    .needle = rgb565(36, 18, 8),
+    .label = rgb565(42, 22, 8),
+    .labelShadow = rgb565(170, 98, 28),
+    .pivotOuter = rgb565(36, 18, 8),
+    .pivotInner = rgb565(130, 75, 26),
+    .clipOn = rgb565(255, 44, 24),
+    .clipOff = rgb565(84, 30, 10),
+    .clipHighlightOn = rgb565(255, 176, 96),
+    .clipHighlightOff = rgb565(130, 62, 24),
+    .glowCenterX = kAnalogVuDisplayWidth / 2,
+    .glowCenterY = kAnalogVuDisplayHeight + 18,
+    .glowRadius = 160,
+    .glowStrength = 230,
+    .arcPointHalfThickness = 1,
+    .outerArcOutwardPixels = 4,
+    .minorTickHalfThickness = 1,
+    .majorTickHalfThickness = 2,
+    .needleHalfThickness = 2,
+    .labelX = 70,
+    .labelY = 74,
+    .labelScale = 3,
+    .labelHalfThickness = 1,
+    .labelShadowOffsetX = 1,
+    .labelShadowOffsetY = 1,
+    .clipX = kAnalogVuDisplayWidth - 19,
+    .clipY = 20,
+    .clipRadius = 6,
+    .clipHighlightOffsetX = 2,
+    .clipHighlightOffsetY = -2,
+    .clipHighlightRadius = 2,
+};
+
+const AnalogVuTheme &activeAnalogVuTheme = kAnalogVuIncandescentTheme;
 
 uint8_t clampToByte(float value) {
     if (value <= 0.0f) {
@@ -873,6 +1088,129 @@ void drawFrame() {
     drawFrameColor(color);
 }
 
+struct PixelRect {
+    int x;
+    int y;
+    int width;
+    int height;
+};
+
+PixelRect emptyRect() {
+    return {0, 0, 0, 0};
+}
+
+bool rectValid(const PixelRect &rect) {
+    return rect.width > 0 && rect.height > 0;
+}
+
+PixelRect clampRect(PixelRect rect, int maxWidth, int maxHeight) {
+    const int x0 = max(0, rect.x);
+    const int y0 = max(0, rect.y);
+    const int x1 = min(maxWidth, rect.x + rect.width);
+    const int y1 = min(maxHeight, rect.y + rect.height);
+    if (x1 <= x0 || y1 <= y0) {
+        return emptyRect();
+    }
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+PixelRect rectFromBounds(int x0, int y0, int x1, int y1) {
+    if (x1 < x0 || y1 < y0) {
+        return emptyRect();
+    }
+    return {x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+}
+
+PixelRect unionRect(const PixelRect &a, const PixelRect &b) {
+    if (!rectValid(a)) {
+        return b;
+    }
+    if (!rectValid(b)) {
+        return a;
+    }
+
+    const int x0 = min(a.x, b.x);
+    const int y0 = min(a.y, b.y);
+    const int x1 = max(a.x + a.width, b.x + b.width);
+    const int y1 = max(a.y + a.height, b.y + b.height);
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+PixelRect expandRect(PixelRect rect, int padding, int maxWidth,
+                     int maxHeight) {
+    if (!rectValid(rect)) {
+        return rect;
+    }
+    rect.x -= padding;
+    rect.y -= padding;
+    rect.width += padding * 2;
+    rect.height += padding * 2;
+    return clampRect(rect, maxWidth, maxHeight);
+}
+
+PixelRect alignRectForPushColors(PixelRect rect, int displayX, int maxWidth,
+                                 int maxHeight) {
+    rect = clampRect(rect, maxWidth, maxHeight);
+    if (!rectValid(rect)) {
+        return rect;
+    }
+
+    int left = rect.x;
+    int right = rect.x + rect.width;
+
+    if (((displayX + left) & 0x01) != 0) {
+        if (left > 0) {
+            --left;
+        } else {
+            ++right;
+        }
+    }
+
+    if (((right - left) & 0x01) != 0) {
+        if (right < maxWidth) {
+            ++right;
+        } else if (left > 0) {
+            --left;
+        }
+    }
+
+    return clampRect({left, rect.y, right - left, rect.height},
+                     maxWidth, maxHeight);
+}
+
+void copyBaseRectToGraph(const uint16_t *base, int baseWidth,
+                         const PixelRect &rect) {
+    for (int row = 0; row < rect.height; ++row) {
+        memcpy(&graphPixels[row * rect.width],
+               &base[(rect.y + row) * baseWidth + rect.x],
+               (size_t)rect.width * sizeof(uint16_t));
+    }
+}
+
+bool initVuRenderBuffers() {
+    if (vuBasePixels != nullptr && analogVuBasePixels != nullptr) {
+        return true;
+    }
+
+    if (vuBasePixels == nullptr) {
+        vuBasePixels = (uint16_t *)ps_malloc(
+            (size_t)kVuDisplayWidth * kVuDisplayHeight * sizeof(uint16_t));
+    }
+    if (analogVuBasePixels == nullptr) {
+        analogVuBasePixels = (uint16_t *)ps_malloc(
+            (size_t)kAnalogVuDisplayWidth * kAnalogVuDisplayHeight *
+            sizeof(uint16_t));
+    }
+
+    if (vuBasePixels == nullptr || analogVuBasePixels == nullptr) {
+        lockSerial();
+        Serial.println("VU render buffer allocation failed");
+        unlockSerial();
+        return false;
+    }
+    return true;
+}
+
 void clearSpectrogram() {
     if (spectrogramMutex != nullptr) {
         xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
@@ -882,9 +1220,17 @@ void clearSpectrogram() {
         memset(scopeTraceTop, kScopeDisplayHeight / 2, sizeof(scopeTraceTop));
         memset(scopeTraceBottom, kScopeDisplayHeight / 2,
                sizeof(scopeTraceBottom));
+        vuLevel = 0.0f;
+        vuPeakLevel = 0.0f;
+        vuSmoothedLevel = 0.0f;
+        vuClipActive = false;
+        vuClipHold = 0;
         spectrogramWriteColumn = 0;
         analyzerReady = false;
         scopeTraceReady = false;
+        vuReady = false;
+        vuScreenReady = false;
+        analogVuScreenReady = false;
         xSemaphoreGive(spectrogramMutex);
     }
 }
@@ -980,6 +1326,673 @@ void renderAnalyzer() {
     amoled.pushColors(kAnalyzerDisplayX, kAnalyzerDisplayY,
                       kAnalyzerDisplayWidth, kAnalyzerDisplayHeight,
                       graphPixels);
+}
+
+uint16_t vuColorForLevel(float level) {
+    if (level < 0.72f) {
+        return rgb565(34, 220, 78);
+    }
+    if (level < 0.88f) {
+        return rgb565(246, 220, 52);
+    }
+    return rgb565(255, 64, 42);
+}
+
+constexpr int kVuMeterX = 12;
+constexpr int kVuMeterWidth = kVuDisplayWidth - 24;
+constexpr int kVuMeterHeight = 24;
+constexpr int kVuMeterY = (kVuDisplayHeight - kVuMeterHeight) / 2;
+constexpr int kVuTickTop = kVuMeterY - 16;
+constexpr int kVuTickHeight = 10;
+constexpr int kVuClipCenterX = kVuDisplayWidth - 23;
+constexpr int kVuClipCenterY = 24;
+constexpr int kVuClipRadius = 7;
+constexpr int kVuPeakMarkerWidth = 2;
+
+void setVuDrawTarget(uint16_t *pixels, int width, int height, int originX,
+                     int originY) {
+    vuDrawPixels = pixels;
+    vuDrawWidth = width;
+    vuDrawHeight = height;
+    vuDrawOriginX = originX;
+    vuDrawOriginY = originY;
+}
+
+void plotVuPixel(int x, int y, uint16_t color) {
+    uint16_t *target = vuDrawPixels != nullptr ? vuDrawPixels : graphPixels;
+    const int localX = x - vuDrawOriginX;
+    const int localY = y - vuDrawOriginY;
+    if (localX < 0 || localX >= vuDrawWidth ||
+        localY < 0 || localY >= vuDrawHeight) {
+        return;
+    }
+    target[localY * vuDrawWidth + localX] = color;
+}
+
+void fillVuRect(int x, int y, int width, int height, uint16_t color) {
+    for (int yy = y; yy < y + height; ++yy) {
+        for (int xx = x; xx < x + width; ++xx) {
+            plotVuPixel(xx, yy, color);
+        }
+    }
+}
+
+void fillVuCircle(int centerX, int centerY, int radius, uint16_t color) {
+    const int radiusSquared = radius * radius;
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radiusSquared) {
+                plotVuPixel(centerX + x, centerY + y, color);
+            }
+        }
+    }
+}
+
+void drawVuBox(int x, int y, int width, int height, uint16_t color) {
+    fillVuRect(x, y, width, 1, color);
+    fillVuRect(x, y + height - 1, width, 1, color);
+    fillVuRect(x, y, 1, height, color);
+    fillVuRect(x + width - 1, y, 1, height, color);
+}
+
+bool buildVuBase() {
+    if (!initVuRenderBuffers()) {
+        return false;
+    }
+
+    setVuDrawTarget(vuBasePixels, kVuDisplayWidth, kVuDisplayHeight, 0, 0);
+    for (int y = 0; y < kVuDisplayHeight; ++y) {
+        for (int x = 0; x < kVuDisplayWidth; ++x) {
+            const bool grid = (x % 46 == 0) || (y % 27 == 0);
+            vuBasePixels[y * kVuDisplayWidth + x] =
+                grid ? kColorAnalyzerGrid : kColorBlack;
+        }
+    }
+
+    const uint16_t dimGreen = rgb565(3, 38, 14);
+    const uint16_t dimYellow = rgb565(44, 38, 4);
+    const uint16_t dimRed = rgb565(50, 8, 6);
+    const uint16_t border = rgb565(70, 96, 98);
+
+    drawVuBox(kVuMeterX - 1, kVuMeterY - 1, kVuMeterWidth + 2,
+              kVuMeterHeight + 2, border);
+
+    for (int x = 0; x < kVuMeterWidth; ++x) {
+        const float t = (float)x / (float)(kVuMeterWidth - 1);
+        const uint16_t color = t < 0.72f ? dimGreen
+                               : t < 0.88f ? dimYellow
+                                            : dimRed;
+        for (int y = 0; y < kVuMeterHeight; ++y) {
+            plotVuPixel(kVuMeterX + x, kVuMeterY + y, color);
+        }
+    }
+
+    for (int tick = 0; tick <= 4; ++tick) {
+        const int x = kVuMeterX + (tick * (kVuMeterWidth - 1)) / 4;
+        fillVuRect(x, kVuTickTop, 1, kVuTickHeight, border);
+    }
+
+    vuBaseReady = true;
+    return true;
+}
+
+int vuFillWidthForLevel(float level, bool ready) {
+    if (!ready) {
+        return 0;
+    }
+    int fillWidth = (int)(level * (float)kVuMeterWidth + 0.5f);
+    if (fillWidth < 0) {
+        fillWidth = 0;
+    }
+    if (fillWidth > kVuMeterWidth) {
+        fillWidth = kVuMeterWidth;
+    }
+    return fillWidth;
+}
+
+int vuPeakXForLevel(float peak, bool ready) {
+    if (!ready) {
+        return kVuMeterX;
+    }
+    int peakX = kVuMeterX + (int)(peak * (float)(kVuMeterWidth - 1) + 0.5f);
+    if (peakX < kVuMeterX) {
+        peakX = kVuMeterX;
+    }
+    if (peakX >= kVuMeterX + kVuMeterWidth) {
+        peakX = kVuMeterX + kVuMeterWidth - 1;
+    }
+    return peakX;
+}
+
+PixelRect vuDynamicLevelRect(int fillWidth, int peakX, bool ready) {
+    PixelRect rect = emptyRect();
+    if (ready && fillWidth > 0) {
+        rect = unionRect(rect, {kVuMeterX, kVuMeterY, fillWidth,
+                                kVuMeterHeight});
+    }
+    if (ready) {
+        rect = unionRect(rect, {peakX, kVuMeterY - 3, kVuPeakMarkerWidth,
+                                kVuMeterHeight + 6});
+    }
+    return expandRect(rect, 1, kVuDisplayWidth, kVuDisplayHeight);
+}
+
+PixelRect vuClipRect() {
+    return expandRect(rectFromBounds(kVuClipCenterX - kVuClipRadius,
+                                     kVuClipCenterY - kVuClipRadius,
+                                     kVuClipCenterX + kVuClipRadius,
+                                     kVuClipCenterY + kVuClipRadius),
+                      2, kVuDisplayWidth, kVuDisplayHeight);
+}
+
+void drawVuDynamicLevel(int fillWidth, int peakX, bool ready) {
+    if (ready) {
+        for (int x = 0; x < fillWidth; ++x) {
+            const float t = (float)x / (float)(kVuMeterWidth - 1);
+            const uint16_t color = vuColorForLevel(t);
+            for (int y = 0; y < kVuMeterHeight; ++y) {
+                plotVuPixel(kVuMeterX + x, kVuMeterY + y, color);
+            }
+        }
+
+        fillVuRect(peakX, kVuMeterY - 3, kVuPeakMarkerWidth,
+                   kVuMeterHeight + 6,
+                   rgb565(230, 245, 245));
+    }
+}
+
+void drawVuClipLamp(bool clip) {
+    const uint16_t clipColor = clip ? rgb565(255, 24, 18)
+                                    : rgb565(48, 0, 0);
+    fillVuCircle(kVuClipCenterX, kVuClipCenterY, kVuClipRadius, clipColor);
+    fillVuCircle(kVuClipCenterX + 2, kVuClipCenterY - 2, 2,
+                 clip ? rgb565(255, 180, 160) : rgb565(70, 8, 8));
+}
+
+void pushVuDirtyRect(const PixelRect &rect) {
+    const PixelRect pushRect =
+        alignRectForPushColors(rect, kVuDisplayX, kVuDisplayWidth,
+                               kVuDisplayHeight);
+    if (!rectValid(pushRect)) {
+        return;
+    }
+    amoled.pushColors(kVuDisplayX + pushRect.x, kVuDisplayY + pushRect.y,
+                      pushRect.width, pushRect.height, graphPixels);
+}
+
+void renderVuMeter() {
+    if (spectrogramMutex == nullptr) {
+        return;
+    }
+
+    float level = 0.0f;
+    float peak = 0.0f;
+    bool clip = false;
+    bool ready = false;
+
+    xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
+    level = vuLevel;
+    peak = vuPeakLevel;
+    clip = vuClipActive;
+    ready = vuReady;
+    xSemaphoreGive(spectrogramMutex);
+
+    if (!vuBaseReady && !buildVuBase()) {
+        return;
+    }
+
+    const int fillWidth = vuFillWidthForLevel(level, ready);
+    const int peakX = vuPeakXForLevel(peak, ready);
+
+    if (!vuScreenReady) {
+        const PixelRect full = {0, 0, kVuDisplayWidth, kVuDisplayHeight};
+        copyBaseRectToGraph(vuBasePixels, kVuDisplayWidth, full);
+        setVuDrawTarget(graphPixels, full.width, full.height, full.x, full.y);
+        drawVuDynamicLevel(fillWidth, peakX, ready);
+        drawVuClipLamp(clip);
+        pushVuDirtyRect(full);
+    } else {
+        const PixelRect oldLevelRect =
+            vuDynamicLevelRect(vuLastFillWidth, vuLastPeakX, vuLastReady);
+        const PixelRect newLevelRect =
+            vuDynamicLevelRect(fillWidth, peakX, ready);
+        const PixelRect levelRect = unionRect(oldLevelRect, newLevelRect);
+        if (rectValid(levelRect)) {
+            const PixelRect levelPushRect =
+                alignRectForPushColors(levelRect, kVuDisplayX,
+                                       kVuDisplayWidth, kVuDisplayHeight);
+            copyBaseRectToGraph(vuBasePixels, kVuDisplayWidth,
+                                levelPushRect);
+            setVuDrawTarget(graphPixels, levelPushRect.width,
+                            levelPushRect.height, levelPushRect.x,
+                            levelPushRect.y);
+            drawVuDynamicLevel(fillWidth, peakX, ready);
+            pushVuDirtyRect(levelPushRect);
+        }
+
+        if (clip != vuLastClipActive) {
+            const PixelRect clipDirty =
+                alignRectForPushColors(vuClipRect(), kVuDisplayX,
+                                       kVuDisplayWidth, kVuDisplayHeight);
+            copyBaseRectToGraph(vuBasePixels, kVuDisplayWidth, clipDirty);
+            setVuDrawTarget(graphPixels, clipDirty.width, clipDirty.height,
+                            clipDirty.x, clipDirty.y);
+            drawVuClipLamp(clip);
+            pushVuDirtyRect(clipDirty);
+        }
+    }
+
+    vuLastFillWidth = fillWidth;
+    vuLastPeakX = peakX;
+    vuLastClipActive = clip;
+    vuLastReady = ready;
+    vuScreenReady = true;
+}
+
+constexpr int kAnalogVuCenterX = kAnalogVuDisplayWidth / 2;
+constexpr int kAnalogVuCenterY = 116;
+constexpr int kAnalogVuArcRadius = 86;
+constexpr int kAnalogVuTickOuter = 83;
+constexpr int kAnalogVuTickInner = 68;
+constexpr int kAnalogVuStartDeg = 205;
+constexpr int kAnalogVuEndDeg = 335;
+constexpr int kAnalogVuSweepDeg = kAnalogVuEndDeg - kAnalogVuStartDeg;
+constexpr int kAnalogVuNeedleLength = 70;
+constexpr int kAnalogVuPivotRadius = 6;
+
+void setAnalogVuDrawTarget(uint16_t *pixels, int width, int height,
+                           int originX, int originY) {
+    analogVuDrawPixels = pixels;
+    analogVuDrawWidth = width;
+    analogVuDrawHeight = height;
+    analogVuDrawOriginX = originX;
+    analogVuDrawOriginY = originY;
+}
+
+void plotAnalogVuPixel(int x, int y, uint16_t color) {
+    uint16_t *target =
+        analogVuDrawPixels != nullptr ? analogVuDrawPixels : graphPixels;
+    const int localX = x - analogVuDrawOriginX;
+    const int localY = y - analogVuDrawOriginY;
+    if (localX < 0 || localX >= analogVuDrawWidth ||
+        localY < 0 || localY >= analogVuDrawHeight) {
+        return;
+    }
+    target[localY * analogVuDrawWidth + localX] = color;
+}
+
+void drawAnalogVuLine(int x0, int y0, int x1, int y1, uint16_t color) {
+    const int dx = abs(x1 - x0);
+    const int sx = x0 < x1 ? 1 : -1;
+    const int dy = -abs(y1 - y0);
+    const int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        plotAnalogVuPixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        const int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+void fillAnalogVuCircle(int centerX, int centerY, int radius, uint16_t color) {
+    const int radiusSquared = radius * radius;
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radiusSquared) {
+                plotAnalogVuPixel(centerX + x, centerY + y, color);
+            }
+        }
+    }
+}
+
+void plotAnalogVuThickPixel(int x, int y, int halfThickness,
+                            uint16_t color) {
+    for (int yy = y - halfThickness; yy <= y + halfThickness; ++yy) {
+        for (int xx = x - halfThickness; xx <= x + halfThickness; ++xx) {
+            plotAnalogVuPixel(xx, yy, color);
+        }
+    }
+}
+
+void drawAnalogVuThickLine(int x0, int y0, int x1, int y1,
+                           int halfThickness, uint16_t color) {
+    drawAnalogVuLine(x0, y0, x1, y1, color);
+    for (int offset = 1; offset <= halfThickness; ++offset) {
+        drawAnalogVuLine(x0 - offset, y0, x1 - offset, y1, color);
+        drawAnalogVuLine(x0 + offset, y0, x1 + offset, y1, color);
+        drawAnalogVuLine(x0, y0 - offset, x1, y1 - offset, color);
+        drawAnalogVuLine(x0, y0 + offset, x1, y1 + offset, color);
+    }
+}
+
+uint16_t blendRgb565(uint16_t fromColor, uint16_t toColor, uint8_t amount) {
+    const uint16_t fromNative =
+        (uint16_t)((fromColor >> 8) | (fromColor << 8));
+    const uint16_t toNative = (uint16_t)((toColor >> 8) | (toColor << 8));
+
+    const uint8_t fr = fromNative >> 11;
+    const uint8_t fg = (fromNative >> 5) & 0x3F;
+    const uint8_t fb = fromNative & 0x1F;
+    const uint8_t tr = toNative >> 11;
+    const uint8_t tg = (toNative >> 5) & 0x3F;
+    const uint8_t tb = toNative & 0x1F;
+
+    const uint8_t r = fr + (((int)tr - (int)fr) * amount) / 255;
+    const uint8_t g = fg + (((int)tg - (int)fg) * amount) / 255;
+    const uint8_t b = fb + (((int)tb - (int)fb) * amount) / 255;
+    const uint16_t native =
+        ((uint16_t)r << 11) | ((uint16_t)g << 5) | (uint16_t)b;
+    return (uint16_t)((native >> 8) | (native << 8));
+}
+
+uint16_t analogVuBackgroundPixel(const AnalogVuTheme &theme, int x, int y) {
+    const bool stripe = (y % 12) == 0;
+    uint16_t color = stripe ? theme.faceStripe : theme.face;
+
+    if (theme.glowRadius > 0 && theme.glowStrength > 0) {
+        const int dx = x - theme.glowCenterX;
+        const int dy = y - theme.glowCenterY;
+        const int distanceSquared = dx * dx + dy * dy;
+        const int radiusSquared = theme.glowRadius * theme.glowRadius;
+        if (distanceSquared < radiusSquared) {
+            const int glow =
+                (theme.glowStrength * (radiusSquared - distanceSquared)) /
+                radiusSquared;
+            color = blendRgb565(color, theme.faceGlow,
+                                (uint8_t)min(glow, 255));
+        }
+    }
+
+    return color;
+}
+
+void drawAnalogVuLabelAt(const AnalogVuTheme &theme, int x, int y,
+                         uint16_t color) {
+    const int scale = theme.labelScale;
+    const int thick = theme.labelHalfThickness;
+    const int letterWidth = 6 * scale;
+    const int letterHeight = 8 * scale;
+    const int gap = 3 * scale;
+    const int vMidX = x + letterWidth / 2;
+    const int bottomY = y + letterHeight;
+
+    drawAnalogVuThickLine(x, y, vMidX, bottomY, thick, color);
+    drawAnalogVuThickLine(x + letterWidth, y, vMidX, bottomY, thick, color);
+
+    const int uX = x + letterWidth + gap;
+    const int uRight = uX + letterWidth;
+    drawAnalogVuThickLine(uX, y, uX, y + letterHeight - scale, thick,
+                          color);
+    drawAnalogVuThickLine(uRight, y, uRight, y + letterHeight - scale,
+                          thick, color);
+    drawAnalogVuThickLine(uX, bottomY, uRight, bottomY, thick, color);
+}
+
+void drawAnalogVuLabel(const AnalogVuTheme &theme) {
+    drawAnalogVuLabelAt(theme, theme.labelX + theme.labelShadowOffsetX,
+                        theme.labelY + theme.labelShadowOffsetY,
+                        theme.labelShadow);
+    drawAnalogVuLabelAt(theme, theme.labelX, theme.labelY, theme.label);
+}
+
+void drawAnalogVuArc(int centerX, int centerY, int radius, int startDeg,
+                     int endDeg, int halfThickness, uint16_t color) {
+    for (int deg = startDeg; deg <= endDeg; ++deg) {
+        const float rad = (float)deg * PI / 180.0f;
+        const int x = centerX + (int)(cosf(rad) * (float)radius + 0.5f);
+        const int y = centerY + (int)(sinf(rad) * (float)radius + 0.5f);
+        plotAnalogVuThickPixel(x, y, halfThickness, color);
+    }
+}
+
+void drawAnalogVuOuterArc(int centerX, int centerY, int radius, int startDeg,
+                          int endDeg, int outwardPixels, int halfThickness,
+                          uint16_t color) {
+    for (int offset = 0; offset <= outwardPixels; ++offset) {
+        drawAnalogVuArc(centerX, centerY, radius + offset, startDeg, endDeg,
+                        halfThickness, color);
+    }
+}
+
+bool buildAnalogVuBase() {
+    if (!initVuRenderBuffers()) {
+        return false;
+    }
+
+    const AnalogVuTheme &theme = activeAnalogVuTheme;
+    setAnalogVuDrawTarget(analogVuBasePixels, kAnalogVuDisplayWidth,
+                          kAnalogVuDisplayHeight, 0, 0);
+    for (int y = 0; y < kAnalogVuDisplayHeight; ++y) {
+        for (int x = 0; x < kAnalogVuDisplayWidth; ++x) {
+            analogVuBasePixels[y * kAnalogVuDisplayWidth + x] =
+                analogVuBackgroundPixel(theme, x, y);
+        }
+    }
+
+    for (int x = 0; x < kAnalogVuDisplayWidth; ++x) {
+        plotAnalogVuPixel(x, 0, theme.border);
+        plotAnalogVuPixel(x, kAnalogVuDisplayHeight - 1, theme.border);
+    }
+    for (int y = 0; y < kAnalogVuDisplayHeight; ++y) {
+        plotAnalogVuPixel(0, y, theme.border);
+        plotAnalogVuPixel(kAnalogVuDisplayWidth - 1, y, theme.border);
+    }
+
+    drawAnalogVuOuterArc(kAnalogVuCenterX, kAnalogVuCenterY,
+                         kAnalogVuArcRadius, kAnalogVuStartDeg, 278,
+                         theme.outerArcOutwardPixels,
+                         theme.arcPointHalfThickness, theme.greenArc);
+    drawAnalogVuOuterArc(kAnalogVuCenterX, kAnalogVuCenterY,
+                         kAnalogVuArcRadius, 279, 316,
+                         theme.outerArcOutwardPixels,
+                         theme.arcPointHalfThickness, theme.amberArc);
+    drawAnalogVuOuterArc(kAnalogVuCenterX, kAnalogVuCenterY,
+                         kAnalogVuArcRadius, 317, kAnalogVuEndDeg,
+                         theme.outerArcOutwardPixels,
+                         theme.arcPointHalfThickness, theme.redArc);
+
+    for (int tick = 0; tick <= 10; ++tick) {
+        const int deg = kAnalogVuStartDeg + (tick * kAnalogVuSweepDeg) / 10;
+        const float rad = (float)deg * PI / 180.0f;
+        const int inner =
+            (tick % 5 == 0) ? kAnalogVuTickInner - 4 : kAnalogVuTickInner;
+        const int x0 =
+            kAnalogVuCenterX + (int)(cosf(rad) * (float)inner + 0.5f);
+        const int y0 =
+            kAnalogVuCenterY + (int)(sinf(rad) * (float)inner + 0.5f);
+        const int x1 = kAnalogVuCenterX +
+                       (int)(cosf(rad) * (float)kAnalogVuTickOuter + 0.5f);
+        const int y1 = kAnalogVuCenterY +
+                       (int)(sinf(rad) * (float)kAnalogVuTickOuter + 0.5f);
+        const int halfThickness = tick % 5 == 0
+                                      ? theme.majorTickHalfThickness
+                                      : theme.minorTickHalfThickness;
+        drawAnalogVuThickLine(x0, y0, x1, y1, halfThickness, theme.tick);
+    }
+
+    drawAnalogVuArc(kAnalogVuCenterX, kAnalogVuCenterY, 54,
+                    kAnalogVuStartDeg, kAnalogVuEndDeg,
+                    theme.arcPointHalfThickness, theme.innerArc);
+    drawAnalogVuLabel(theme);
+
+    analogVuBaseReady = true;
+    return true;
+}
+
+int analogVuNeedleDegForLevel(float level, bool ready) {
+    float shownLevel = ready ? level : 0.0f;
+    if (shownLevel < 0.0f) {
+        shownLevel = 0.0f;
+    }
+    if (shownLevel > 1.0f) {
+        shownLevel = 1.0f;
+    }
+    return kAnalogVuStartDeg +
+           (int)(shownLevel * (float)kAnalogVuSweepDeg + 0.5f);
+}
+
+void analogVuNeedleEndpoint(int needleDeg, int &x, int &y) {
+    const float needleRad = (float)needleDeg * PI / 180.0f;
+    x = kAnalogVuCenterX +
+        (int)(cosf(needleRad) * (float)kAnalogVuNeedleLength + 0.5f);
+    y = kAnalogVuCenterY +
+        (int)(sinf(needleRad) * (float)kAnalogVuNeedleLength + 0.5f);
+}
+
+PixelRect analogVuNeedleRect(int needleDeg, const AnalogVuTheme &theme) {
+    int needleX = 0;
+    int needleY = 0;
+    analogVuNeedleEndpoint(needleDeg, needleX, needleY);
+    const int x0 = min(kAnalogVuCenterX, needleX);
+    const int y0 = min(kAnalogVuCenterY, needleY);
+    const int x1 = max(kAnalogVuCenterX, needleX);
+    const int y1 = max(kAnalogVuCenterY, needleY);
+    const int padding = max(kAnalogVuPivotRadius + 2,
+                            theme.needleHalfThickness + 4);
+    return expandRect(rectFromBounds(x0, y0, x1, y1), padding,
+                      kAnalogVuDisplayWidth, kAnalogVuDisplayHeight);
+}
+
+PixelRect analogVuClipRect(const AnalogVuTheme &theme) {
+    const PixelRect lamp =
+        rectFromBounds(theme.clipX - theme.clipRadius,
+                       theme.clipY - theme.clipRadius,
+                       theme.clipX + theme.clipRadius,
+                       theme.clipY + theme.clipRadius);
+    const PixelRect highlight =
+        rectFromBounds(theme.clipX + theme.clipHighlightOffsetX -
+                           theme.clipHighlightRadius,
+                       theme.clipY + theme.clipHighlightOffsetY -
+                           theme.clipHighlightRadius,
+                       theme.clipX + theme.clipHighlightOffsetX +
+                           theme.clipHighlightRadius,
+                       theme.clipY + theme.clipHighlightOffsetY +
+                           theme.clipHighlightRadius);
+    return expandRect(unionRect(lamp, highlight), 2,
+                      kAnalogVuDisplayWidth, kAnalogVuDisplayHeight);
+}
+
+void drawAnalogVuNeedleAndPivot(const AnalogVuTheme &theme, int needleDeg) {
+    int needleX = 0;
+    int needleY = 0;
+    analogVuNeedleEndpoint(needleDeg, needleX, needleY);
+    drawAnalogVuThickLine(kAnalogVuCenterX, kAnalogVuCenterY, needleX,
+                          needleY,
+                          theme.needleHalfThickness, theme.needle);
+
+    fillAnalogVuCircle(kAnalogVuCenterX, kAnalogVuCenterY,
+                       kAnalogVuPivotRadius, theme.pivotOuter);
+    fillAnalogVuCircle(kAnalogVuCenterX, kAnalogVuCenterY, 3,
+                       theme.pivotInner);
+}
+
+void drawAnalogVuClipLamp(const AnalogVuTheme &theme, bool clip) {
+    const uint16_t clipColor = clip ? theme.clipOn : theme.clipOff;
+    fillAnalogVuCircle(theme.clipX, theme.clipY, theme.clipRadius,
+                       clipColor);
+    fillAnalogVuCircle(theme.clipX + theme.clipHighlightOffsetX,
+                       theme.clipY + theme.clipHighlightOffsetY,
+                       theme.clipHighlightRadius,
+                       clip ? theme.clipHighlightOn
+                            : theme.clipHighlightOff);
+}
+
+void pushAnalogVuDirtyRect(const PixelRect &rect) {
+    const PixelRect pushRect =
+        alignRectForPushColors(rect, kAnalogVuDisplayX,
+                               kAnalogVuDisplayWidth,
+                               kAnalogVuDisplayHeight);
+    if (!rectValid(pushRect)) {
+        return;
+    }
+    amoled.pushColors(kAnalogVuDisplayX + pushRect.x,
+                      kAnalogVuDisplayY + pushRect.y,
+                      pushRect.width, pushRect.height, graphPixels);
+}
+
+void renderAnalogVuMeter() {
+    if (spectrogramMutex == nullptr) {
+        return;
+    }
+
+    float level = 0.0f;
+    bool clip = false;
+    bool ready = false;
+
+    xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
+    level = vuLevel;
+    clip = vuClipActive;
+    ready = vuReady;
+    xSemaphoreGive(spectrogramMutex);
+
+    if (!analogVuBaseReady && !buildAnalogVuBase()) {
+        return;
+    }
+
+    const AnalogVuTheme &theme = activeAnalogVuTheme;
+    const int needleDeg = analogVuNeedleDegForLevel(level, ready);
+
+    if (!analogVuScreenReady) {
+        const PixelRect full = {0, 0, kAnalogVuDisplayWidth,
+                                kAnalogVuDisplayHeight};
+        copyBaseRectToGraph(analogVuBasePixels, kAnalogVuDisplayWidth, full);
+        setAnalogVuDrawTarget(graphPixels, full.width, full.height,
+                              full.x, full.y);
+        drawAnalogVuNeedleAndPivot(theme, needleDeg);
+        drawAnalogVuClipLamp(theme, clip);
+        pushAnalogVuDirtyRect(full);
+    } else {
+        if (needleDeg != analogVuLastNeedleDeg ||
+            ready != analogVuLastReady) {
+            const PixelRect oldNeedle =
+                analogVuNeedleRect(analogVuLastNeedleDeg, theme);
+            const PixelRect newNeedle =
+                analogVuNeedleRect(needleDeg, theme);
+            const PixelRect needleDirty =
+                alignRectForPushColors(unionRect(oldNeedle, newNeedle),
+                                       kAnalogVuDisplayX,
+                                       kAnalogVuDisplayWidth,
+                                       kAnalogVuDisplayHeight);
+            copyBaseRectToGraph(analogVuBasePixels, kAnalogVuDisplayWidth,
+                                needleDirty);
+            setAnalogVuDrawTarget(graphPixels, needleDirty.width,
+                                  needleDirty.height, needleDirty.x,
+                                  needleDirty.y);
+            drawAnalogVuNeedleAndPivot(theme, needleDeg);
+            pushAnalogVuDirtyRect(needleDirty);
+        }
+
+        if (clip != analogVuLastClipActive) {
+            const PixelRect clipDirty =
+                alignRectForPushColors(analogVuClipRect(theme),
+                                       kAnalogVuDisplayX,
+                                       kAnalogVuDisplayWidth,
+                                       kAnalogVuDisplayHeight);
+            copyBaseRectToGraph(analogVuBasePixels, kAnalogVuDisplayWidth,
+                                clipDirty);
+            setAnalogVuDrawTarget(graphPixels, clipDirty.width,
+                                  clipDirty.height, clipDirty.x,
+                                  clipDirty.y);
+            drawAnalogVuClipLamp(theme, clip);
+            pushAnalogVuDirtyRect(clipDirty);
+        }
+    }
+
+    analogVuLastNeedleDeg = needleDeg;
+    analogVuLastClipActive = clip;
+    analogVuLastReady = ready;
+    analogVuScreenReady = true;
 }
 
 uint8_t scopeYForValue(float value, float scale) {
@@ -1385,6 +2398,43 @@ void publishAnalyzerFrame() {
     xSemaphoreGive(spectrogramMutex);
 }
 
+void publishVuFrame() {
+    if (spectrogramMutex == nullptr) {
+        return;
+    }
+
+    const float rms = lastFrameRms > 1.0f ? lastFrameRms : 1.0f;
+    const float db = 20.0f * log10f(rms / 32768.0f);
+    float target = (db - kVuMinDb) / (kVuMaxDb - kVuMinDb);
+    if (target < 0.0f) {
+        target = 0.0f;
+    } else if (target > 1.0f) {
+        target = 1.0f;
+    }
+
+    if (target > vuSmoothedLevel) {
+        vuSmoothedLevel = vuSmoothedLevel * 0.35f + target * 0.65f;
+    } else {
+        vuSmoothedLevel = vuSmoothedLevel * 0.92f + target * 0.08f;
+    }
+
+    const bool clipped = lastFrameClipped > 0 ||
+                         lastFrameMax >= kVuClipThreshold ||
+                         lastFrameMin <= -kVuClipThreshold;
+    if (clipped) {
+        vuClipHold = kVuClipHoldFrames;
+    } else if (vuClipHold > 0) {
+        --vuClipHold;
+    }
+
+    xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
+    vuLevel = vuSmoothedLevel;
+    vuPeakLevel = target;
+    vuClipActive = vuClipHold > 0;
+    vuReady = true;
+    xSemaphoreGive(spectrogramMutex);
+}
+
 void publishOscilloscopeFrame() {
     if (spectrogramMutex == nullptr) {
         return;
@@ -1638,6 +2688,36 @@ void toggleRecording() {
     }
 }
 
+void buttonTask(void *) {
+    bool displayNoiseRecalibrationPending = false;
+    uint32_t displayNoiseRecalibrationReleaseMs = 0;
+
+    for (;;) {
+        const uint32_t now = millis();
+
+        if (topButton.updatePressed()) {
+            toggleRecording();
+        }
+
+        if (sideButton.updateReleased()) {
+            displayNoiseRecalibrationPending = true;
+            displayNoiseRecalibrationReleaseMs = now;
+            lockSerial();
+            Serial.println("display noise recalibration queued");
+            unlockSerial();
+        }
+
+        if (displayNoiseRecalibrationPending &&
+            (uint32_t)(now - displayNoiseRecalibrationReleaseMs) >=
+                kDisplayNoiseRecalibrationDelayMs) {
+            displayNoiseRecalibrationPending = false;
+            requestDisplayNoiseCalibration("side button");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(kLoopHousekeepingIntervalMs));
+    }
+}
+
 void queueRecordingFrame() {
     if (!sdRecordingActive || recordFrames == nullptr ||
         recordFreeQueue == nullptr || recordFilledQueue == nullptr) {
@@ -1805,6 +2885,7 @@ void captureTask(void *) {
     int64_t totalFftUs = 0;
     int64_t totalPublishFftUs = 0;
     int64_t totalPublishAnalyzerUs = 0;
+    int64_t totalPublishVuUs = 0;
     int64_t totalPublishScopeUs = 0;
     int64_t totalActiveUs = 0;
     int64_t totalFrameUs = 0;
@@ -1830,6 +2911,8 @@ void captureTask(void *) {
         const int64_t t3 = esp_timer_get_time();
         publishAnalyzerFrame();
         const int64_t t4 = esp_timer_get_time();
+        publishVuFrame();
+        const int64_t tVu = esp_timer_get_time();
         publishOscilloscopeFrame();
         const int64_t t5 = esp_timer_get_time();
 
@@ -1840,7 +2923,8 @@ void captureTask(void *) {
         totalFftUs += t2 - tRecord;
         totalPublishFftUs += t3 - t2;
         totalPublishAnalyzerUs += t4 - t3;
-        totalPublishScopeUs += t5 - t4;
+        totalPublishVuUs += tVu - t4;
+        totalPublishScopeUs += t5 - tVu;
         totalActiveUs += t5 - t1;
         totalFrameUs += t5 - t0;
         ++frames;
@@ -1863,7 +2947,7 @@ void captureTask(void *) {
             lockSerial();
             Serial.printf("capture avg: period=%lldus read(wait)=%lldus "
                           "rec_q=%lldus fft=%lldus pub_fft=%lldus pub_an=%lldus "
-                          "pub_scope=%lldus active=%lldus duty=%.1f%% "
+                          "pub_vu=%lldus pub_scope=%lldus active=%lldus duty=%.1f%% "
                           "slot=%d "
                           "pcm min=%d max=%d mean=%.1f rms=%.1f clip=%u "
                           "fft avg=%.1fdB peak=%.1fdB noise=%.1fdB "
@@ -1874,6 +2958,7 @@ void captureTask(void *) {
                           totalFftUs / kDiagnosticsFrames,
                           totalPublishFftUs / kDiagnosticsFrames,
                           totalPublishAnalyzerUs / kDiagnosticsFrames,
+                          totalPublishVuUs / kDiagnosticsFrames,
                           totalPublishScopeUs / kDiagnosticsFrames,
                           totalActiveUs / kDiagnosticsFrames,
                           percentOf(totalActiveUs, reportWallUs), kMicSlot,
@@ -1902,6 +2987,7 @@ void captureTask(void *) {
             totalFftUs = 0;
             totalPublishFftUs = 0;
             totalPublishAnalyzerUs = 0;
+            totalPublishVuUs = 0;
             totalPublishScopeUs = 0;
             totalActiveUs = 0;
             totalFrameUs = 0;
@@ -1922,7 +3008,9 @@ void displayTask(void *) {
     int64_t totalWaitUs = 0;
     int64_t totalClearUs = 0;
     int64_t totalFrameUs = 0;
+    int64_t totalVuUs = 0;
     int64_t totalAnalyzerUs = 0;
+    int64_t totalAnalogVuUs = 0;
     int64_t totalSpectrogramUs = 0;
     int64_t totalScopeUs = 0;
     int64_t totalActiveUs = 0;
@@ -1939,8 +3027,12 @@ void displayTask(void *) {
             frameDirty = false;
         }
 
+        const int64_t vuStartUs = esp_timer_get_time();
+        renderVuMeter();
         const int64_t analyzerStartUs = esp_timer_get_time();
         renderAnalyzer();
+        const int64_t analogVuStartUs = esp_timer_get_time();
+        renderAnalogVuMeter();
         const int64_t spectrogramStartUs = esp_timer_get_time();
         renderSpectrogram();
         const int64_t scopeStartUs = esp_timer_get_time();
@@ -1954,7 +3046,9 @@ void displayTask(void *) {
         totalClearUs += clearUs;
         frameUs = doneUs - frameStartUs;
         totalFrameUs += frameUs;
-        totalAnalyzerUs += spectrogramStartUs - analyzerStartUs;
+        totalVuUs += analyzerStartUs - vuStartUs;
+        totalAnalyzerUs += analogVuStartUs - analyzerStartUs;
+        totalAnalogVuUs += spectrogramStartUs - analogVuStartUs;
         totalSpectrogramUs += scopeStartUs - spectrogramStartUs;
         totalScopeUs += frameStartUs - scopeStartUs;
         totalActiveUs += doneUs - afterWaitUs;
@@ -1981,7 +3075,8 @@ void displayTask(void *) {
             const int64_t reportWallUs = doneUs - reportStartUs;
             lockSerial();
             Serial.printf("display avg: period=%lldus wait=%lldus clear=%lldus "
-                          "frame=%lldus analyzer=%lldus fft=%lldus "
+                          "frame=%lldus vu=%lldus analyzer=%lldus "
+                          "analog_vu=%lldus fft=%lldus "
                           "scope=%lldus active=%lldus duty=%.1f%% "
                           "notify=%u timeout=%u drop_1s=%u drop_report=%u "
                           "drop_total=%u\n",
@@ -1989,7 +3084,9 @@ void displayTask(void *) {
                           totalWaitUs / kDiagnosticsFrames,
                           totalClearUs / kDiagnosticsFrames,
                           totalFrameUs / kDiagnosticsFrames,
+                          totalVuUs / kDiagnosticsFrames,
                           totalAnalyzerUs / kDiagnosticsFrames,
+                          totalAnalogVuUs / kDiagnosticsFrames,
                           totalSpectrogramUs / kDiagnosticsFrames,
                           totalScopeUs / kDiagnosticsFrames,
                           totalActiveUs / kDiagnosticsFrames,
@@ -2003,7 +3100,9 @@ void displayTask(void *) {
             totalWaitUs = 0;
             totalClearUs = 0;
             totalFrameUs = 0;
+            totalVuUs = 0;
             totalAnalyzerUs = 0;
+            totalAnalogVuUs = 0;
             totalSpectrogramUs = 0;
             totalScopeUs = 0;
             totalActiveUs = 0;
@@ -2011,6 +3110,8 @@ void displayTask(void *) {
             timeoutFrames = 0;
             droppedFramesSinceReport = 0;
         }
+
+        vTaskDelay(1);
     }
 }
 
@@ -2097,7 +3198,9 @@ void setup() {
     Serial.println("clear screen complete");
 
     drawFrame();
+    renderVuMeter();
     renderAnalyzer();
+    renderAnalogVuMeter();
     renderSpectrogram();
     renderOscilloscope();
     drawWifiStatusLabelOnce();
@@ -2108,6 +3211,8 @@ void setup() {
                             &displayTaskHandle, 1);
     xTaskCreatePinnedToCore(captureTask, "capture_fft", 12288, nullptr, 5,
                             &captureTaskHandle, 0);
+    xTaskCreatePinnedToCore(buttonTask, "buttons", 3072, nullptr, 4,
+                            &buttonTaskHandle, 0);
     if (recordBuffersReady && sdCardReady) {
         xTaskCreatePinnedToCore(sdWriterTask, "sd_writer", 8192, nullptr, 2,
                                 &sdWriterTaskHandle, 0);
@@ -2118,34 +3223,8 @@ void setup() {
 }
 
 void loop() {
-    static uint32_t lastHousekeepingMs = 0;
-    static bool displayNoiseRecalibrationPending = false;
-    static uint32_t displayNoiseRecalibrationReleaseMs = 0;
-
     if (ftpActive) {
         ftpServer.handleFTP();
-    }
-
-    const uint32_t now = millis();
-    if ((uint32_t)(now - lastHousekeepingMs) >= kLoopHousekeepingIntervalMs) {
-        lastHousekeepingMs = now;
-
-        if (topButton.updatePressed()) {
-            toggleRecording();
-        }
-
-        if (sideButton.updateReleased()) {
-            displayNoiseRecalibrationPending = true;
-            displayNoiseRecalibrationReleaseMs = now;
-            Serial.println("display noise recalibration queued");
-        }
-
-        if (displayNoiseRecalibrationPending &&
-            (uint32_t)(now - displayNoiseRecalibrationReleaseMs) >=
-                kDisplayNoiseRecalibrationDelayMs) {
-            displayNoiseRecalibrationPending = false;
-            requestDisplayNoiseCalibration("side button");
-        }
     }
 
     yield();

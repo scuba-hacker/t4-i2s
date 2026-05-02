@@ -54,7 +54,7 @@ Startup sequence:
 8. Start the FTP server if WiFi connects.
 9. Initialise FFT and I2S.
 10. Clear the LVGL startup screen and draw the initial analyser display.
-11. Start display, capture, and SD-writer FreeRTOS tasks.
+11. Start display, capture, button, and SD-writer FreeRTOS tasks.
 
 Recording is not started automatically at boot.
 
@@ -94,16 +94,31 @@ helper flushes through the same AMOLED `pushColors()` path as the rest of the
 application and uses a PSRAM draw buffer. For now LVGL is deliberately limited
 to boot status so it does not compete with the live analyser display task.
 
-The display task is pinned to core 1 and updates three 200 x 135 graphics:
+The display task is pinned to core 1 and updates the live audio graphics:
 
+- VU meter to the left of the FFT waterfall. It is 184 x 135 pixels so it clears
+  the display frame edge, and includes a red clipping indicator.
 - Spectrum analyser above the FFT display.
+- Analogue VU meter to the right of the FFT waterfall. It is also 184 x 135
+  pixels and shows the same level with a needle. Its colours, line
+  thicknesses, and clip-lamp geometry are selected by a compile-time theme; a
+  warm incandescent theme is currently active, with light and dark themes kept
+  as alternatives.
 - FFT waterfall in the centre.
 - Oscilloscope below the FFT display.
 
+The two VU meters cache their static backgrounds in PSRAM. After the first full
+draw, the linear VU meter pushes only the changed bar/peak rectangle plus the
+clip lamp when needed. The analogue VU meter pushes the union of the previous
+and current needle rectangles, with the clip lamp treated as a separate small
+dirty rectangle. Dirty rectangles are expanded horizontally before pushing so
+their absolute X coordinate and width are even, which is required by the AMOLED
+`pushColors()` path.
+
 The analyser uses 32 configurable bands over roughly 50 Hz to 4 kHz. The FFT
 waterfall displays bins 4 to 256, which corresponds to roughly 62.5 Hz to 4 kHz
-at a 16 kHz sample rate. The oscilloscope uses the latest PCM frame and applies
-automatic vertical scaling.
+at a 16 kHz sample rate. The VU meters and oscilloscope use the latest PCM
+frame; the oscilloscope applies automatic vertical scaling.
 
 The FFT waterfall and spectrum analyser use a fixed display noise floor. The
 floor is calibrated from the first 5 seconds of FFT frames after the live
@@ -167,8 +182,9 @@ recording and wait for `sd status: idle` before power-off or firmware upload.
 - Side button: release to recalibrate the FFT/analyser display noise floor after
   a 500 ms quiet delay.
 
-Button polling is done from the Arduino `loop()` on a non-blocking 10 ms
-housekeeping cadence.
+Button polling is done from a dedicated FreeRTOS task pinned to core 0 on a
+non-blocking 10 ms cadence. This keeps recording and calibration controls
+responsive even when the display task is busy drawing the live graphics.
 
 ## WiFi and FTP
 
@@ -198,7 +214,7 @@ Capture diagnostics include:
 - I2S read/wait time.
 - Record queue time.
 - FFT time.
-- Publication time for FFT, analyser, and oscilloscope data.
+- Publication time for FFT, analyser, VU, and oscilloscope data.
 - Capture active duty.
 - PCM min, max, mean, RMS, clipping.
 - FFT average, peak, display noise floor, and whether the display noise floor
