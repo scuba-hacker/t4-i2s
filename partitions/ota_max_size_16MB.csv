@@ -1,0 +1,13 @@
+# Name,     Type, SubType, Offset,     Size
+nvs,        data, nvs,     0x9000,     0x5000
+otadata,    data, ota,     0xE000,     0x2000
+app0,       app,  ota_0,   0x10000,    0x770000
+app1,       app,  ota_1,   0x780000,   0x770000
+spiffs,     data, spiffs,  0xEF0000,   0x110000
+
+
+# nvs 20KB - Non-volatile storage
+# otadata 8KB - OTA partition info
+# app0 7.4375MB - Primary app partition
+# app1 7.4375MB - Secondary app (OTA)
+# spiffs 1.0625MB - LittleFS file system storage (for map PNG files)
