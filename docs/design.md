@@ -115,6 +115,13 @@ dirty rectangle. Dirty rectangles are expanded horizontally before pushing so
 their absolute X coordinate and width are even, which is required by the AMOLED
 `pushColors()` path.
 
+The spectrum analyser has a compile-time feature flag,
+`kAnalyzerDirtyRectEnabled`, for comparing full redraws against dirty redraws.
+When enabled, the analyser caches the static grid/background in PSRAM and pushes
+only the lower full-width strip that can have changed, using the greater of the
+previous and current bar heights. The existing `display avg` diagnostic
+`analyzer=` field is the timing comparison point.
+
 The analyser uses 32 configurable bands over roughly 50 Hz to 4 kHz. The FFT
 waterfall displays bins 4 to 256, which corresponds to roughly 62.5 Hz to 4 kHz
 at a 16 kHz sample rate. The VU meters and oscilloscope use the latest PCM
@@ -130,7 +137,8 @@ after startup.
 The side button can request another display-noise calibration. The request is
 triggered on button release, then delayed by 500 ms so the physical button click
 is not captured as part of the calibration sample. A white `Calibrating` label is
-shown in the lower-left corner while calibration is active.
+shown in the bottom-right information panel above the WiFi SSID and IP address
+while calibration is active.
 
 The display frame border shows operating state:
 
@@ -139,11 +147,12 @@ The display frame border shows operating state:
 - Yellow: recording start/stop in progress.
 - Red error state: I2S or FFT not ready.
 
-If WiFi connects during startup, the SSID and IP address are drawn once in the
-lower-right area beside the oscilloscope. The label uses TFT_eSPI's built-in
-Font 2 bitmap data but is rendered into a small local pixel buffer before being
-sent to the AMOLED. It is static because the WiFi identity is not expected to
-change after startup.
+The four corner ninths of the screen use the same static dark grid backdrop as
+the graph sprites. If WiFi connects during startup, the SSID and IP address are
+drawn once in the bottom-right information panel beside the oscilloscope. The
+panel labels use TFT_eSPI Font 4 RLE data rendered into small local pixel
+buffers before being sent to the AMOLED. The WiFi identity is static because it
+is not expected to change after startup.
 
 Display updates are driven by notifications from the capture task. If several
 notifications arrive before the display task catches up, they are coalesced and
@@ -236,6 +245,7 @@ Display diagnostics include:
 - Display frame period.
 - Wait time.
 - Clear/frame/analyser/FFT/scope render time.
+- FFT waterfall pixel maximum and non-zero pixel count.
 - Display active duty.
 - Notification count.
 - Timeout count.

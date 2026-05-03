@@ -22,6 +22,7 @@
 #include "fft.h"
 
 #include <Fonts/Font16.h>
+#include <Fonts/Font32rle.h>
 #include <SimpleFTPServer.h>
 
 FtpServer ftpServer;
@@ -79,16 +80,23 @@ constexpr int kScopeDisplayWidth = 200;
 constexpr int kScopeDisplayHeight = 135;
 constexpr int kScopeDisplayX = kFftDisplayX;
 constexpr int kScopeDisplayY = kFftDisplayY + kFftDisplayHeight;
+constexpr int kStaticPanelWidth = kScreenWidth / 3;
+constexpr int kStaticPanelHeight = kScreenHeight / 3;
+constexpr int kStaticPanelLeftX = 0;
+constexpr int kStaticPanelRightX = kStaticPanelWidth * 2;
+constexpr int kStaticPanelTopY = 0;
+constexpr int kStaticPanelBottomY = kStaticPanelHeight * 2;
 constexpr int kWifiLabelX = kScopeDisplayX + kScopeDisplayWidth + 8;
 constexpr int kWifiLabelWidth = kScreenWidth - kWifiLabelX - 12;
-constexpr int kWifiLabelHeight = 42;
+constexpr int kWifiLabelHeight = 62;
 constexpr int kWifiLabelY =
-    kScopeDisplayY + kScopeDisplayHeight - kWifiLabelHeight;
-constexpr int kCalibrationLabelX = 12;
-constexpr int kCalibrationLabelWidth = 128;
-constexpr int kCalibrationLabelHeight = 22;
+    kScreenHeight - kWifiLabelHeight - 12;
+constexpr int kCalibrationLabelWidth = kWifiLabelWidth;
+constexpr int kCalibrationLabelHeight = 30;
+constexpr int kCalibrationLabelX =
+    kWifiLabelX + kWifiLabelWidth - kCalibrationLabelWidth;
 constexpr int kCalibrationLabelY =
-    kScreenHeight - kCalibrationLabelHeight - 12;
+    kWifiLabelY - kCalibrationLabelHeight - 8;
 constexpr int kAnalyzerDisplayWidth = 200;
 constexpr int kAnalyzerDisplayHeight = 135;
 constexpr int kAnalyzerDisplayX = kFftDisplayX;
@@ -117,6 +125,7 @@ constexpr float kAnalyzerHighHz = 4000.0f;
 constexpr float kAnalyzerSmoothing = 0.65f;
 constexpr float kAnalyzerNoiseMarginDb = 10.0f;
 constexpr float kAnalyzerRangeDb = 58.0f;
+constexpr bool kAnalyzerDirtyRectEnabled = true;
 constexpr float kVuMinDb = -60.0f;
 constexpr float kVuMaxDb = 0.0f;
 constexpr int16_t kVuClipThreshold = 32600;
@@ -197,6 +206,7 @@ float vuPeakLevel = 0.0f;
 bool vuClipActive = false;
 uint16_t fftPixels[kFftDisplayWidth * kFftDisplayHeight];
 uint16_t graphPixels[kScopeDisplayWidth * kScopeDisplayHeight];
+uint16_t *analyzerBasePixels = nullptr;
 uint16_t *vuBasePixels = nullptr;
 uint16_t *analogVuBasePixels = nullptr;
 uint16_t *vuDrawPixels = nullptr;
@@ -214,7 +224,12 @@ uint16_t calibrationLabelPixels[kCalibrationLabelWidth * kCalibrationLabelHeight
 uint16_t palette[256];
 uint16_t solidLine[kScreenWidth];
 uint16_t spectrogramWriteColumn = 0;
+uint8_t lastSpectrogramRenderMax = 0;
+uint32_t lastSpectrogramRenderNonzero = 0;
 bool analyzerReady = false;
+bool analyzerBaseReady = false;
+bool analyzerScreenReady = false;
+uint8_t analyzerLastBarHeights[kAnalyzerBandCount];
 bool scopeTraceReady = false;
 bool vuReady = false;
 bool vuBaseReady = false;
@@ -846,6 +861,28 @@ int font16TextWidth(const char *text) {
     return width > 0 ? width - 1 : 0;
 }
 
+int font32CharWidth(char c) {
+    if (c < firstchr_f32 || c >= firstchr_f32 + nr_chrs_f32) {
+        return 0;
+    }
+    return pgm_read_byte(widtbl_f32 + (c - firstchr_f32));
+}
+
+int font32TextWidth(const char *text) {
+    int width = 0;
+    if (text == nullptr) {
+        return width;
+    }
+
+    while (*text != '\0') {
+        const int charWidth = font32CharWidth(*text++);
+        if (charWidth > 0) {
+            width += charWidth + 1;
+        }
+    }
+    return width > 0 ? width - 1 : 0;
+}
+
 void fitFont16Text(const char *source, char *dest, size_t destSize,
                    int maxWidth) {
     if (dest == nullptr || destSize == 0) {
@@ -875,6 +912,95 @@ void fitFont16Text(const char *source, char *dest, size_t destSize,
         width = nextWidth;
     }
     dest[out] = '\0';
+}
+
+void fitFont32Text(const char *source, char *dest, size_t destSize,
+                   int maxWidth) {
+    if (dest == nullptr || destSize == 0) {
+        return;
+    }
+
+    dest[0] = '\0';
+    if (source == nullptr) {
+        return;
+    }
+
+    int width = 0;
+    size_t out = 0;
+    while (*source != '\0' && out + 1 < destSize) {
+        const int charWidth = font32CharWidth(*source);
+        if (charWidth <= 0) {
+            ++source;
+            continue;
+        }
+
+        const int nextWidth = width == 0 ? charWidth : width + 1 + charWidth;
+        if (nextWidth > maxWidth) {
+            break;
+        }
+
+        dest[out++] = *source++;
+        width = nextWidth;
+    }
+    dest[out] = '\0';
+}
+
+bool staticPanelOriginForAbsolutePixel(int x, int y, int &originX,
+                                       int &originY) {
+    const bool left = x >= kStaticPanelLeftX &&
+                      x < kStaticPanelLeftX + kStaticPanelWidth;
+    const bool right = x >= kStaticPanelRightX &&
+                       x < kStaticPanelRightX + kStaticPanelWidth;
+    const bool top = y >= kStaticPanelTopY &&
+                     y < kStaticPanelTopY + kStaticPanelHeight;
+    const bool bottom = y >= kStaticPanelBottomY &&
+                        y < kStaticPanelBottomY + kStaticPanelHeight;
+
+    if (left && top) {
+        originX = kStaticPanelLeftX;
+        originY = kStaticPanelTopY;
+        return true;
+    }
+    if (right && top) {
+        originX = kStaticPanelRightX;
+        originY = kStaticPanelTopY;
+        return true;
+    }
+    if (left && bottom) {
+        originX = kStaticPanelLeftX;
+        originY = kStaticPanelBottomY;
+        return true;
+    }
+    if (right && bottom) {
+        originX = kStaticPanelRightX;
+        originY = kStaticPanelBottomY;
+        return true;
+    }
+
+    return false;
+}
+
+uint16_t staticPanelBackdropColor(int x, int y) {
+    int originX = 0;
+    int originY = 0;
+    if (!staticPanelOriginForAbsolutePixel(x, y, originX, originY)) {
+        return kColorBlack;
+    }
+
+    const int localX = x - originX;
+    const int localY = y - originY;
+    const bool grid = (localX % 50 == 0) || (localY % 27 == 0);
+    return grid ? kColorAnalyzerGrid : kColorBlack;
+}
+
+void fillStaticPanelBackdrop(uint16_t *pixels, int x, int y, int width,
+                             int height) {
+    for (int yy = 0; yy < height; ++yy) {
+        for (int xx = 0; xx < width; ++xx) {
+            pixels[yy * width + xx] =
+                staticPanelBackdropColor(x + xx, y + yy);
+        }
+    }
 }
 
 void plotWifiLabelPixel(int x, int y, uint16_t color) {
@@ -911,6 +1037,33 @@ void drawFont16CharToWifiLabel(int x, int y, char c, uint16_t color) {
     }
 }
 
+void drawFont32CharToWifiLabel(int x, int y, char c, uint16_t color) {
+    if (c < firstchr_f32 || c >= firstchr_f32 + nr_chrs_f32) {
+        return;
+    }
+
+    const int charIndex = c - firstchr_f32;
+    const int charWidth = pgm_read_byte(widtbl_f32 + charIndex);
+    const uint8_t *glyph =
+        (const uint8_t *)pgm_read_ptr(&chrtbl_f32[charIndex]);
+
+    int pc = 0;
+    const int pixelCount = charWidth * chr_hgt_f32;
+    while (pc < pixelCount) {
+        uint8_t run = pgm_read_byte(glyph++);
+        const bool foreground = (run & 0x80) != 0;
+        run = (run & 0x7F) + 1;
+
+        while (run-- > 0 && pc < pixelCount) {
+            if (foreground) {
+                plotWifiLabelPixel(x + (pc % charWidth),
+                                   y + (pc / charWidth), color);
+            }
+            ++pc;
+        }
+    }
+}
+
 void drawFont16StringToWifiLabel(const char *text, int rightX, int y,
                                  uint16_t color) {
     if (text == nullptr || text[0] == '\0') {
@@ -928,20 +1081,35 @@ void drawFont16StringToWifiLabel(const char *text, int rightX, int y,
     }
 }
 
+void drawFont32StringToWifiLabel(const char *text, int rightX, int y,
+                                 uint16_t color) {
+    if (text == nullptr || text[0] == '\0') {
+        return;
+    }
+
+    int x = rightX - font32TextWidth(text);
+    while (*text != '\0') {
+        const int charWidth = font32CharWidth(*text);
+        if (charWidth > 0) {
+            drawFont32CharToWifiLabel(x, y, *text, color);
+            x += charWidth + 1;
+        }
+        ++text;
+    }
+}
+
 void drawWifiStatusLabelOnce() {
     if (!wifiReadyForServices()) {
         return;
     }
 
-    for (size_t i = 0; i < sizeof(wifiLabelPixels) / sizeof(wifiLabelPixels[0]);
-         ++i) {
-        wifiLabelPixels[i] = kColorBlack;
-    }
+    fillStaticPanelBackdrop(wifiLabelPixels, kWifiLabelX, kWifiLabelY,
+                            kWifiLabelWidth, kWifiLabelHeight);
 
     char ssid[48];
     char ip[24];
     fitFont16Text(WiFi.SSID().c_str(), ssid, sizeof(ssid), kWifiLabelWidth - 4);
-    fitFont16Text(WiFi.localIP().toString().c_str(), ip, sizeof(ip),
+    fitFont32Text(WiFi.localIP().toString().c_str(), ip, sizeof(ip),
                   kWifiLabelWidth - 4);
 
   //  const uint16_t ssidColor = rgb565(210, 238, 245);
@@ -951,8 +1119,8 @@ void drawWifiStatusLabelOnce() {
     const uint16_t ipColor = rgb565(255, 255, 255);
 
     const int rightX = kWifiLabelWidth - 2;
-    drawFont16StringToWifiLabel(ssid, rightX, 2, ssidColor);
-    drawFont16StringToWifiLabel(ip, rightX, 2 + chr_hgt_f16 + 4, ipColor);
+    drawFont16StringToWifiLabel(ssid, rightX, 0, ssidColor);
+    drawFont32StringToWifiLabel(ip, rightX, chr_hgt_f32 + 4, ipColor);
 
     amoled.pushColors(kWifiLabelX, kWifiLabelY, kWifiLabelWidth,
                       kWifiLabelHeight, wifiLabelPixels);
@@ -994,6 +1162,33 @@ void drawFont16CharToCalibrationLabel(int x, int y, char c, uint16_t color) {
     }
 }
 
+void drawFont32CharToCalibrationLabel(int x, int y, char c, uint16_t color) {
+    if (c < firstchr_f32 || c >= firstchr_f32 + nr_chrs_f32) {
+        return;
+    }
+
+    const int charIndex = c - firstchr_f32;
+    const int charWidth = pgm_read_byte(widtbl_f32 + charIndex);
+    const uint8_t *glyph =
+        (const uint8_t *)pgm_read_ptr(&chrtbl_f32[charIndex]);
+
+    int pc = 0;
+    const int pixelCount = charWidth * chr_hgt_f32;
+    while (pc < pixelCount) {
+        uint8_t run = pgm_read_byte(glyph++);
+        const bool foreground = (run & 0x80) != 0;
+        run = (run & 0x7F) + 1;
+
+        while (run-- > 0 && pc < pixelCount) {
+            if (foreground) {
+                plotCalibrationLabelPixel(x + (pc % charWidth),
+                                          y + (pc / charWidth), color);
+            }
+            ++pc;
+        }
+    }
+}
+
 void drawFont16StringToCalibrationLabel(const char *text, int x, int y,
                                         uint16_t color) {
     if (text == nullptr) {
@@ -1010,6 +1205,22 @@ void drawFont16StringToCalibrationLabel(const char *text, int x, int y,
     }
 }
 
+void drawFont32StringToCalibrationLabel(const char *text, int x, int y,
+                                        uint16_t color) {
+    if (text == nullptr) {
+        return;
+    }
+
+    while (*text != '\0') {
+        const int charWidth = font32CharWidth(*text);
+        if (charWidth > 0) {
+            drawFont32CharToCalibrationLabel(x, y, *text, color);
+            x += charWidth + 1;
+        }
+        ++text;
+    }
+}
+
 void renderCalibrationStatusLabel() {
     static bool labelVisible = false;
     const bool shouldShow = !displayNoiseCalibrated;
@@ -1017,15 +1228,17 @@ void renderCalibrationStatusLabel() {
         return;
     }
 
-    for (size_t i = 0;
-         i < sizeof(calibrationLabelPixels) / sizeof(calibrationLabelPixels[0]);
-         ++i) {
-        calibrationLabelPixels[i] = kColorBlack;
-    }
+    fillStaticPanelBackdrop(calibrationLabelPixels, kCalibrationLabelX,
+                            kCalibrationLabelY, kCalibrationLabelWidth,
+                            kCalibrationLabelHeight);
 
     if (shouldShow) {
-        drawFont16StringToCalibrationLabel("Calibrating", 2, 2,
-                                           rgb565(255, 255, 255));
+        char label[24];
+        fitFont32Text("Calibrating", label, sizeof(label),
+                      kCalibrationLabelWidth - 4);
+        const int x = kCalibrationLabelWidth - 2 - font32TextWidth(label);
+        drawFont32StringToCalibrationLabel(label, x, 0,
+                                           rgb565(0, 180, 0));
     }
 
     amoled.pushColors(kCalibrationLabelX, kCalibrationLabelY,
@@ -1060,6 +1273,43 @@ void pushSolidRect(int x, int y, int width, int height, uint16_t color) {
             yield();
         }
     }
+}
+
+void pushStaticGridRect(int x, int y, int width, int height) {
+    if (width <= 0 || height <= 0 || x < 0 || y < 0 ||
+        x + width > amoled.width() || y + height > amoled.height()) {
+        return;
+    }
+
+    const size_t bufferPixels = sizeof(graphPixels) / sizeof(graphPixels[0]);
+    int rowsPerChunk = (int)(bufferPixels / (size_t)width);
+    if (rowsPerChunk < 1) {
+        rowsPerChunk = 1;
+    }
+
+    for (int row = 0; row < height; row += rowsPerChunk) {
+        int chunkRows = height - row;
+        if (chunkRows > rowsPerChunk) {
+            chunkRows = rowsPerChunk;
+        }
+
+        fillStaticPanelBackdrop(graphPixels, x, y + row, width, chunkRows);
+        amoled.pushColors(x, y + row, width, chunkRows, graphPixels);
+        if (((row / rowsPerChunk) & 0x03) == 0x03) {
+            yield();
+        }
+    }
+}
+
+void drawStaticBackgroundPanels() {
+    pushStaticGridRect(kStaticPanelLeftX, kStaticPanelTopY,
+                       kStaticPanelWidth, kStaticPanelHeight);
+    pushStaticGridRect(kStaticPanelRightX, kStaticPanelTopY,
+                       kStaticPanelWidth, kStaticPanelHeight);
+    pushStaticGridRect(kStaticPanelLeftX, kStaticPanelBottomY,
+                       kStaticPanelWidth, kStaticPanelHeight);
+    pushStaticGridRect(kStaticPanelRightX, kStaticPanelBottomY,
+                       kStaticPanelWidth, kStaticPanelHeight);
 }
 
 void clearScreen() {
@@ -1211,11 +1461,30 @@ bool initVuRenderBuffers() {
     return true;
 }
 
+bool initAnalyzerRenderBuffer() {
+    if (analyzerBasePixels != nullptr) {
+        return true;
+    }
+
+    analyzerBasePixels = (uint16_t *)ps_malloc(
+        (size_t)kAnalyzerDisplayWidth * kAnalyzerDisplayHeight *
+        sizeof(uint16_t));
+
+    if (analyzerBasePixels == nullptr) {
+        lockSerial();
+        Serial.println("analyzer render buffer allocation failed");
+        unlockSerial();
+        return false;
+    }
+    return true;
+}
+
 void clearSpectrogram() {
     if (spectrogramMutex != nullptr) {
         xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
         memset(spectrogram, 0, sizeof(spectrogram));
         memset(analyzerBarHeights, 0, sizeof(analyzerBarHeights));
+        memset(analyzerLastBarHeights, 0, sizeof(analyzerLastBarHeights));
         memset(analyzerLevels, 0, sizeof(analyzerLevels));
         memset(scopeTraceTop, kScopeDisplayHeight / 2, sizeof(scopeTraceTop));
         memset(scopeTraceBottom, kScopeDisplayHeight / 2,
@@ -1227,6 +1496,7 @@ void clearSpectrogram() {
         vuClipHold = 0;
         spectrogramWriteColumn = 0;
         analyzerReady = false;
+        analyzerScreenReady = false;
         scopeTraceReady = false;
         vuReady = false;
         vuScreenReady = false;
@@ -1240,16 +1510,29 @@ void renderSpectrogram() {
         return;
     }
 
+    uint8_t renderMax = 0;
+    uint32_t renderNonzero = 0;
+
     xSemaphoreTake(spectrogramMutex, portMAX_DELAY);
     const uint16_t nextColumn = spectrogramWriteColumn;
 
     for (int y = 0; y < kFftDisplayHeight; ++y) {
         for (int x = 0; x < kFftDisplayWidth; ++x) {
             const int srcColumn = (nextColumn + x) % kFftDisplayWidth;
-            fftPixels[y * kFftDisplayWidth + x] = palette[spectrogram[srcColumn][y]];
+            const uint8_t value = spectrogram[srcColumn][y];
+            if (value > renderMax) {
+                renderMax = value;
+            }
+            if (value > 0) {
+                ++renderNonzero;
+            }
+            fftPixels[y * kFftDisplayWidth + x] = palette[value];
         }
     }
     xSemaphoreGive(spectrogramMutex);
+
+    lastSpectrogramRenderMax = renderMax;
+    lastSpectrogramRenderNonzero = renderNonzero;
 
     amoled.pushColors(kFftDisplayX, kFftDisplayY, kFftDisplayWidth,
                       kFftDisplayHeight, fftPixels);
@@ -1278,6 +1561,139 @@ uint16_t analyzerColorForY(int y) {
     return rgb565(r, g, b);
 }
 
+constexpr int kAnalyzerBarsLeft =
+    (kAnalyzerDisplayWidth - kAnalyzerActiveWidth) / 2;
+constexpr int kAnalyzerBarsBottom = kAnalyzerDisplayHeight - 4;
+constexpr int kAnalyzerMaxBarHeight = kAnalyzerDisplayHeight - 8;
+
+void fillAnalyzerBase(uint16_t *pixels) {
+    for (int y = 0; y < kAnalyzerDisplayHeight; ++y) {
+        for (int x = 0; x < kAnalyzerDisplayWidth; ++x) {
+            const bool grid = (x % 50 == 0) || (y % 27 == 0);
+            pixels[y * kAnalyzerDisplayWidth + x] =
+                grid ? kColorAnalyzerGrid : kColorBlack;
+        }
+    }
+}
+
+bool buildAnalyzerBase() {
+    if (!initAnalyzerRenderBuffer()) {
+        return false;
+    }
+    fillAnalyzerBase(analyzerBasePixels);
+    analyzerBaseReady = true;
+    return true;
+}
+
+void drawAnalyzerBarsIntoRect(const uint8_t *barHeights, bool barsReady,
+                              const PixelRect &rect) {
+    if (barsReady) {
+        for (int band = 0; band < kAnalyzerBandCount; ++band) {
+            int height = barHeights[band];
+            if (height > kAnalyzerMaxBarHeight) {
+                height = kAnalyzerMaxBarHeight;
+            }
+            const int x0 =
+                kAnalyzerBarsLeft + band * (kAnalyzerBandWidth + kAnalyzerBandGap);
+            const int y0 = kAnalyzerBarsBottom - height + 1;
+            const int drawX0 = max(x0, rect.x);
+            const int drawX1 = min(x0 + kAnalyzerBandWidth,
+                                   rect.x + rect.width);
+            const int drawY0 = max(y0, rect.y);
+            const int drawY1 = min(kAnalyzerBarsBottom + 1,
+                                   rect.y + rect.height);
+            if (drawX1 <= drawX0 || drawY1 <= drawY0) {
+                continue;
+            }
+            for (int x = x0; x < x0 + kAnalyzerBandWidth; ++x) {
+                if (x < drawX0 || x >= drawX1) {
+                    continue;
+                }
+                for (int y = drawY0; y < drawY1; ++y) {
+                    graphPixels[(y - rect.y) * rect.width + (x - rect.x)] =
+                        analyzerColorForY(y);
+                }
+            }
+        }
+    }
+}
+
+void renderAnalyzerFull(const uint8_t *barHeights, bool barsReady) {
+    fillAnalyzerBase(graphPixels);
+    const PixelRect full = {0, 0, kAnalyzerDisplayWidth,
+                            kAnalyzerDisplayHeight};
+    drawAnalyzerBarsIntoRect(barHeights, barsReady, full);
+    amoled.pushColors(kAnalyzerDisplayX, kAnalyzerDisplayY,
+                      kAnalyzerDisplayWidth, kAnalyzerDisplayHeight,
+                      graphPixels);
+    memcpy(analyzerLastBarHeights, barHeights, sizeof(analyzerLastBarHeights));
+    analyzerScreenReady = true;
+}
+
+int analyzerMaxHeight(const uint8_t *barHeights, bool barsReady) {
+    if (!barsReady) {
+        return 0;
+    }
+
+    int maxHeight = 0;
+    for (int band = 0; band < kAnalyzerBandCount; ++band) {
+        if (barHeights[band] > maxHeight) {
+            maxHeight = barHeights[band];
+        }
+    }
+    if (maxHeight > kAnalyzerMaxBarHeight) {
+        maxHeight = kAnalyzerMaxBarHeight;
+    }
+    return maxHeight;
+}
+
+void renderAnalyzerDirty(const uint8_t *barHeights, bool barsReady) {
+    if (!analyzerBaseReady && !buildAnalyzerBase()) {
+        renderAnalyzerFull(barHeights, barsReady);
+        return;
+    }
+
+    if (!analyzerScreenReady) {
+        const PixelRect full = {0, 0, kAnalyzerDisplayWidth,
+                                kAnalyzerDisplayHeight};
+        copyBaseRectToGraph(analyzerBasePixels, kAnalyzerDisplayWidth, full);
+        drawAnalyzerBarsIntoRect(barHeights, barsReady, full);
+        amoled.pushColors(kAnalyzerDisplayX, kAnalyzerDisplayY,
+                          kAnalyzerDisplayWidth, kAnalyzerDisplayHeight,
+                          graphPixels);
+        memcpy(analyzerLastBarHeights, barHeights,
+               sizeof(analyzerLastBarHeights));
+        analyzerScreenReady = true;
+        return;
+    }
+
+    const int oldMaxHeight = analyzerMaxHeight(analyzerLastBarHeights, true);
+    const int newMaxHeight = analyzerMaxHeight(barHeights, barsReady);
+    const int dirtyHeight = max(oldMaxHeight, newMaxHeight);
+    if (dirtyHeight <= 0) {
+        memcpy(analyzerLastBarHeights, barHeights,
+               sizeof(analyzerLastBarHeights));
+        return;
+    }
+
+    const int dirtyY = kAnalyzerBarsBottom - dirtyHeight + 1;
+    const PixelRect dirtyRect =
+        alignRectForPushColors({0, dirtyY, kAnalyzerDisplayWidth,
+                                kAnalyzerBarsBottom - dirtyY + 1},
+                               kAnalyzerDisplayX, kAnalyzerDisplayWidth,
+                               kAnalyzerDisplayHeight);
+    if (!rectValid(dirtyRect)) {
+        return;
+    }
+
+    copyBaseRectToGraph(analyzerBasePixels, kAnalyzerDisplayWidth, dirtyRect);
+    drawAnalyzerBarsIntoRect(barHeights, barsReady, dirtyRect);
+    amoled.pushColors(kAnalyzerDisplayX + dirtyRect.x,
+                      kAnalyzerDisplayY + dirtyRect.y,
+                      dirtyRect.width, dirtyRect.height, graphPixels);
+    memcpy(analyzerLastBarHeights, barHeights, sizeof(analyzerLastBarHeights));
+}
+
 void renderAnalyzer() {
     if (spectrogramMutex == nullptr) {
         return;
@@ -1291,41 +1707,11 @@ void renderAnalyzer() {
     barsReady = analyzerReady;
     xSemaphoreGive(spectrogramMutex);
 
-    for (int y = 0; y < kAnalyzerDisplayHeight; ++y) {
-        for (int x = 0; x < kAnalyzerDisplayWidth; ++x) {
-            const bool grid = (x % 50 == 0) || (y % 27 == 0);
-            graphPixels[y * kAnalyzerDisplayWidth + x] =
-                grid ? kColorAnalyzerGrid : kColorBlack;
-        }
+    if (kAnalyzerDirtyRectEnabled) {
+        renderAnalyzerDirty(barHeights, barsReady);
+    } else {
+        renderAnalyzerFull(barHeights, barsReady);
     }
-
-    if (barsReady) {
-        constexpr int left =
-            (kAnalyzerDisplayWidth - kAnalyzerActiveWidth) / 2;
-        constexpr int bottom = kAnalyzerDisplayHeight - 4;
-        constexpr int maxHeight = kAnalyzerDisplayHeight - 8;
-
-        for (int band = 0; band < kAnalyzerBandCount; ++band) {
-            int height = barHeights[band];
-            if (height > maxHeight) {
-                height = maxHeight;
-            }
-            const int x0 =
-                left + band * (kAnalyzerBandWidth + kAnalyzerBandGap);
-            const int y0 = bottom - height + 1;
-
-            for (int x = x0; x < x0 + kAnalyzerBandWidth; ++x) {
-                for (int y = y0; y <= bottom; ++y) {
-                    graphPixels[y * kAnalyzerDisplayWidth + x] =
-                        analyzerColorForY(y);
-                }
-            }
-        }
-    }
-
-    amoled.pushColors(kAnalyzerDisplayX, kAnalyzerDisplayY,
-                      kAnalyzerDisplayWidth, kAnalyzerDisplayHeight,
-                      graphPixels);
 }
 
 uint16_t vuColorForLevel(float level) {
@@ -3078,6 +3464,7 @@ void displayTask(void *) {
                           "frame=%lldus vu=%lldus analyzer=%lldus "
                           "analog_vu=%lldus fft=%lldus "
                           "scope=%lldus active=%lldus duty=%.1f%% "
+                          "fft_px_max=%u fft_px_nz=%lu "
                           "notify=%u timeout=%u drop_1s=%u drop_report=%u "
                           "drop_total=%u\n",
                           reportWallUs / kDiagnosticsFrames,
@@ -3091,6 +3478,8 @@ void displayTask(void *) {
                           totalScopeUs / kDiagnosticsFrames,
                           totalActiveUs / kDiagnosticsFrames,
                           percentOf(totalActiveUs, reportWallUs),
+                          lastSpectrogramRenderMax,
+                          (unsigned long)lastSpectrogramRenderNonzero,
                           notifiedFrames, timeoutFrames,
                           droppedFramesLastSecond, droppedFramesSinceReport,
                           droppedFramesTotal);
@@ -3197,6 +3586,7 @@ void setup() {
     clearScreen();
     Serial.println("clear screen complete");
 
+    drawStaticBackgroundPanels();
     drawFrame();
     renderVuMeter();
     renderAnalyzer();
