@@ -187,13 +187,50 @@ recording and wait for `sd status: idle` before power-off or firmware upload.
 
 ## Controls
 
-- Top button: toggle recording start/stop.
+- Top button short press: toggle recording start/stop.
+- Top button long press (3 seconds): reboot into the other OTA partition.
 - Side button: release to recalibrate the FFT/analyser display noise floor after
   a 500 ms quiet delay.
 
 Button polling is done from a dedicated FreeRTOS task pinned to core 0 on a
 non-blocking 10 ms cadence. This keeps recording and calibration controls
 responsive even when the display task is busy drawing the live graphics.
+
+The recording toggle fires on button release, not press, so the gesture
+distinction is unambiguous: a short press completes when the button is released
+before 3 seconds; a long press fires at exactly 3 seconds of continuous hold and
+the subsequent release is ignored.
+
+## Firmware and OTA
+
+This device runs two applications side-by-side in the dual-OTA partition layout:
+Oceanic in `app0` and t4-i2s in `app1`. The long press on the top button calls
+`switchToOtherOtaPartition()`, which detects the currently running partition and
+sets the boot target to the other one before rebooting.
+
+Before switching, `switchToApp()` validates the target partition using
+`esp_ota_get_partition_description()`. If the target partition is empty or
+invalid the switch is aborted and a message is printed to serial; the device
+stays in the current app.
+
+### Upload ordering
+
+The two apps must be installed in a specific order because USB upload always
+writes to `app0` and overwrites the `otadata` partition with `boot_app0.bin`.
+This resets all OTA state and erases any record of a previously installed `app1`
+image.
+
+The correct sequence is:
+
+1. Upload Oceanic via USB. This lands in `app0` and sets `boot_app0.bin` as
+   the active boot record.
+2. Upload t4-i2s via OTA (for example using the `AsyncElegantOTA` web endpoint).
+   OTA upload writes to `app1` and updates `otadata` so the device boots t4-i2s
+   on the next restart.
+
+If t4-i2s is uploaded via USB instead, it lands in `app0` and the `otadata`
+partition is reset, leaving no valid `app1` image. The long-press switch will
+then find the target partition empty and refuse to reboot.
 
 ## WiFi and FTP
 

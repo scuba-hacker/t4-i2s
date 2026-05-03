@@ -1,3 +1,11 @@
+// **** CONCURRENT APP LOAD WITH Oceanic ****
+
+// Upload Oceanic via USB to app0 partition, and then use OTA to upload t4-i2s to app1 partition.
+// If t4-i2s is uploaded via USB, then there is no OTA capability in that app to upload Oceanic.
+// USB upload always uploads to app0 and overwrites the otadata partition with boot_app0.bin so all 
+// trace of the other OTA app are gone.
+// To install the apps side-by-side, Oceanic must be uploaded by USB, and then t4-i2s by OTA.
+
 #include <Arduino.h>
 #include <FS.h>
 #include <LilyGo_AMOLED.h>
@@ -12,6 +20,8 @@
 #include <driver/i2s.h>
 #include <esp_err.h>
 #include <esp_idf_version.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_timer.h>
 
 #include <math.h>
@@ -3061,6 +3071,35 @@ void requestRecordingStop() {
     }
 }
 
+void switchToApp(esp_partition_subtype_t subtype) {
+    const esp_partition_t *target = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, subtype, NULL);
+    if (target == NULL) {
+        Serial.println("OTA switch: target partition not found");
+        return;
+    }
+    esp_app_desc_t desc;
+    if (esp_ota_get_partition_description(target, &desc) != ESP_OK) {
+        Serial.println("OTA switch: target partition empty or invalid");
+        return;
+    }
+    Serial.printf("OTA switch: rebooting into %s\n", desc.project_name);
+    if (esp_ota_set_boot_partition(target) != ESP_OK) {
+        Serial.println("OTA switch: esp_ota_set_boot_partition failed");
+        return;
+    }
+    esp_restart();
+}
+
+void switchToOtherOtaPartition() {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_subtype_t target =
+        (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0)
+            ? ESP_PARTITION_SUBTYPE_APP_OTA_1
+            : ESP_PARTITION_SUBTYPE_APP_OTA_0;
+    switchToApp(target);
+}
+
 void toggleRecording() {
     char fileName[sizeof(sdCurrentFileName)];
     const SdStatus status = getSdStatusSnapshot(fileName, sizeof(fileName));
@@ -3077,12 +3116,29 @@ void toggleRecording() {
 void buttonTask(void *) {
     bool displayNoiseRecalibrationPending = false;
     uint32_t displayNoiseRecalibrationReleaseMs = 0;
+    uint32_t topButtonPressedAtMs = 0;
+    bool topButtonLongPressTriggered = false;
 
     for (;;) {
         const uint32_t now = millis();
 
         if (topButton.updatePressed()) {
-            toggleRecording();
+            topButtonPressedAtMs = now;
+            topButtonLongPressTriggered = false;
+        }
+
+        if (topButton.stablePressed && !topButtonLongPressTriggered &&
+            (uint32_t)(now - topButtonPressedAtMs) >= 3000) {
+            topButtonLongPressTriggered = true;
+            Serial.println("top button long press: switching OTA partition");
+            switchToOtherOtaPartition();
+        }
+
+        if (topButton.updateReleased()) {
+            if (!topButtonLongPressTriggered) {
+                toggleRecording();
+            }
+            topButtonLongPressTriggered = false;
         }
 
         if (sideButton.updateReleased()) {
