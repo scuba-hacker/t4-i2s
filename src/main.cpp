@@ -347,7 +347,15 @@ struct DebouncedButton {
         lastChangeMs = millis();
     }
 
-    bool updatePressed() {
+    static constexpr int kPressed  =  1;
+    static constexpr int kReleased = -1;
+    static constexpr int kNoChange =  0;
+
+    // Call once per loop iteration. Returns kPressed, kReleased, or kNoChange.
+    // Must not be called twice per loop for the same button — a single call
+    // advances the debounce state, so a second call in the same iteration would
+    // consume the event before the caller can act on it.
+    int update() {
         const bool reading = digitalRead(pin) == LOW;
         const uint32_t now = millis();
 
@@ -358,27 +366,10 @@ struct DebouncedButton {
 
         if (reading != stablePressed && (now - lastChangeMs) >= 35) {
             stablePressed = reading;
-            return stablePressed;
+            return stablePressed ? kPressed : kReleased;
         }
 
-        return false;
-    }
-
-    bool updateReleased() {
-        const bool reading = digitalRead(pin) == LOW;
-        const uint32_t now = millis();
-
-        if (reading != lastReading) {
-            lastReading = reading;
-            lastChangeMs = now;
-        }
-
-        if (reading != stablePressed && (now - lastChangeMs) >= 35) {
-            stablePressed = reading;
-            return !stablePressed;
-        }
-
-        return false;
+        return kNoChange;
     }
 };
 
@@ -3122,26 +3113,38 @@ void buttonTask(void *) {
     for (;;) {
         const uint32_t now = millis();
 
-        if (topButton.updatePressed()) {
+        // Sample top button once; result used for both press and release checks.
+        const int topEvent = topButton.update();
+
+        // Record the moment the button went down so we can time the long press.
+        if (topEvent == DebouncedButton::kPressed) {
             topButtonPressedAtMs = now;
             topButtonLongPressTriggered = false;
         }
 
+        // Long press (3 s held): switch OTA partition and reboot.
+        // Flag is set here so the subsequent release check knows not to also
+        // trigger the short-press action.
         if (topButton.stablePressed && !topButtonLongPressTriggered &&
             (uint32_t)(now - topButtonPressedAtMs) >= 3000) {
             topButtonLongPressTriggered = true;
+            lockSerial();
             Serial.println("top button long press: switching OTA partition");
+            unlockSerial();
             switchToOtherOtaPartition();
         }
 
-        if (topButton.updateReleased()) {
+        // Short press (released before long-press threshold): toggle SD recording.
+        if (topEvent == DebouncedButton::kReleased) {
             if (!topButtonLongPressTriggered) {
                 toggleRecording();
             }
             topButtonLongPressTriggered = false;
         }
 
-        if (sideButton.updateReleased()) {
+        // Side button release: queue a display noise recalibration after a short
+        // settle delay so any vibration from pressing the button dies down first.
+        if (sideButton.update() == DebouncedButton::kReleased) {
             displayNoiseRecalibrationPending = true;
             displayNoiseRecalibrationReleaseMs = now;
             lockSerial();
