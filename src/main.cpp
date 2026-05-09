@@ -35,6 +35,8 @@
 #include <Fonts/Font32rle.h>
 #include <SimpleFTPServer.h>
 
+bool enableOtaPartitionSwitch = true;  // Long-press top button switches to the other OTA app partition
+
 FtpServer ftpServer;
 bool ftpActive = false;
 bool writeLogToSerial = true;
@@ -70,8 +72,8 @@ constexpr int kI2SData_GPIO = 41;   // Mic Data
 constexpr bool kLrclkSquareWaveTestEnabled = false;
 constexpr uint32_t kLrclkSquareWaveHalfPeriodMs = 250;
 
-constexpr int kTopButton_GPIO= 48;
-constexpr int kSideButton_GPIO= 21;
+constexpr int kTopButton_GPIO= 48;  // was 48 temporarily 21 (TO SWAP BUTTONS)
+constexpr int kSideButton_GPIO= 21; // was 21 temporarily 47 (TO DISABLE TOP BUTTON WHICH IS 48)
 
 constexpr int kSampleRate = 16000;
 constexpr int kFftSize = 1024;
@@ -3125,7 +3127,8 @@ void buttonTask(void *) {
         // Long press (3 s held): switch OTA partition and reboot.
         // Flag is set here so the subsequent release check knows not to also
         // trigger the short-press action.
-        if (topButton.stablePressed && !topButtonLongPressTriggered &&
+        if (enableOtaPartitionSwitch &&
+            topButton.stablePressed && !topButtonLongPressTriggered &&
             (uint32_t)(now - topButtonPressedAtMs) >= 3000) {
             topButtonLongPressTriggered = true;
             lockSerial();
